@@ -181,6 +181,15 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
+from vllm.v1.attention.backends.cp_holes import (
+    gather_logits_hidden as cp_holes_gather_logits_hidden,
+)
+from vllm.v1.attention.backends.cp_holes import (
+    shard_inputs as cp_holes_shard_inputs,
+)
+from vllm.v1.attention.backends.cp_holes import (
+    sharded_scheme as cp_holes_sharded_scheme,
+)
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
@@ -4052,6 +4061,22 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+            # CP_HOLES sharded dense mode: this PCP rank runs the model on its
+            # own rows of the step only (the attention metadata still
+            # describes the whole step); eager, no padding.
+            cp_scheme = cp_holes_sharded_scheme(attn_metadata)
+            num_tokens_fwd = num_tokens_padded
+            if cp_scheme is not None:
+                assert not use_spec_decode and not self.is_pooling_model, (
+                    "CP_HOLES sharded mode: no spec decode / pooling")
+                assert get_pp_group().world_size == 1, (
+                    "CP_HOLES sharded mode: no PP")
+                input_ids, positions, inputs_embeds = cp_holes_shard_inputs(
+                    cp_scheme, input_ids, positions, inputs_embeds
+                )
+                num_tokens_fwd = int(cp_scheme.own_rows.numel())
+                cudagraph_mode = CUDAGraphMode.NONE
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -4076,7 +4101,7 @@ class GPUModelRunner(
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
-                num_tokens=num_tokens_padded,
+                num_tokens=num_tokens_fwd,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
@@ -4125,7 +4150,13 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
+                if cp_scheme is not None:
+                    # logits rows (tail-last tokens) from the ranks owning them
+                    sample_hidden_states = cp_holes_gather_logits_hidden(
+                        cp_scheme, hidden_states, logits_indices
+                    )
+                else:
+                    sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.

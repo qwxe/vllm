@@ -52,13 +52,14 @@ def _import_backend():
     return be
 
 
-def _worker(rank, world, port, scheme_name, q, holes=True):
+def _worker(rank, world, port, scheme_name, q, holes=True,
+            dense="replicated"):
     try:
         torch.set_num_threads(1)
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(port)
         os.environ["VLLM_CP_HOLES_SCHEME"] = scheme_name
-        os.environ["VLLM_CP_HOLES_DENSE"] = "replicated"
+        os.environ["VLLM_CP_HOLES_DENSE"] = dense
         os.environ["VLLM_CP_HOLES_PASSQ_RATIO"] = "0.35"
         dist.init_process_group("gloo", rank=rank, world_size=world)
         be = _import_backend()
@@ -141,7 +142,8 @@ def _worker(rank, world, port, scheme_name, q, holes=True):
                              get_num_kv_heads=lambda pc: hkv,
                              get_head_size=lambda: dh)
         cfg = SimpleNamespace(model_config=mc, parallel_config=SimpleNamespace(
-            cp_kv_cache_interleave_size=u))
+            cp_kv_cache_interleave_size=u,
+            cp_kv_placement=be.REQUIRED_PLACEMENT[scheme_name]))
         builder = be.CPHolesMetadataBuilder(SimpleNamespace(block_size=u),
                                             ["l0"], cfg, torch.device("cpu"))
         builder.comm = be.CPComm(dist.group.WORLD, rank, world)
@@ -151,10 +153,29 @@ def _worker(rank, world, port, scheme_name, q, holes=True):
                              for x in range(plan0.m)])
         v_all = torch.stack([V[0][int(plan0.qreq[x])][int(plan0.qpos[x])]
                              for x in range(plan0.m)])
-        out = torch.empty(plan0.m, hq * dh)
-        impl.forward(None, Q[0].reshape(plan0.m, -1), k_all.reshape(
-            plan0.m, -1), v_all.reshape(plan0.m, -1), cache, md, output=out)
-        err = (out.view(plan0.m, hq, dh) - ref_o).abs().max().item()
+        q_all = Q[0].reshape(plan0.m, -1)
+        k_all = k_all.reshape(plan0.m, -1)
+        v_all = v_all.reshape(plan0.m, -1)
+        if dense == "sharded":
+            # what the model runner does: run the rank's own rows only
+            scheme = be.sharded_scheme({"l0": md})
+            assert scheme is md.scheme
+            qs, ks_, vs = be.shard_inputs(scheme, q_all, k_all, v_all)
+            own = scheme.own_rows
+            out = torch.empty(own.numel(), hq * dh)
+            impl.forward(None, qs, ks_, vs, cache, md, output=out)
+            err = (out.view(-1, hq, dh) - ref_o[own]).abs().max().item() \
+                if own.numel() else 0.0
+            # logits rows: each request's last token (the tail's last)
+            li = torch.tensor([hi - 1 for _, hi in plan0.req_rows])
+            hid = be.gather_logits_hidden(scheme, out, li)
+            err = max(err, (hid.view(-1, hq, dh) - ref_o[li]).abs().max()
+                      .item())
+        else:
+            assert be.sharded_scheme({"l0": md}) is None
+            out = torch.empty(plan0.m, hq * dh)
+            impl.forward(None, q_all, k_all, v_all, cache, md, output=out)
+            err = (out.view(plan0.m, hq, dh) - ref_o).abs().max().item()
         # cache writes: computed positions this rank holds are now in place
         for i in range(n):
             pos = torch.arange(e_step[i])[plan0.computed_mask(i)]
@@ -169,12 +190,13 @@ def _worker(rank, world, port, scheme_name, q, holes=True):
         q.put((rank, None, traceback.format_exc()))
 
 
-def run(world, scheme_name, holes=True):
+def run(world, scheme_name, holes=True, dense="replicated"):
     import test_cp_gloo as T
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = T._free_port()
-    ps = [ctx.Process(target=_worker, args=(r, world, port, scheme_name, q, holes))
+    ps = [ctx.Process(target=_worker, args=(r, world, port, scheme_name, q, holes,
+                                     dense))
           for r in range(world)]
     for p in ps:
         p.start()
@@ -192,6 +214,7 @@ def test_backend_glue():
         for s in ("ulysses", "passq", "ring", "allgather", "adaptive"):
             assert run(w, s) < 2e-5
             assert run(w, s, holes=False) < 2e-5
+            assert run(w, s, dense="sharded") < 2e-5
 
 
 if __name__ == "__main__":
@@ -202,8 +225,9 @@ if __name__ == "__main__":
     a = ap.parse_args()
     for w in a.world:
         for s in a.schemes:
-            for holes in (True, False):
-                e = run(w, s, holes)
+            for holes, dense in ((True, "replicated"), (False, "replicated"),
+                                 (True, "sharded")):
+                e = run(w, s, holes, dense)
                 print(f"{'OK ' if e < 2e-5 else 'BAD'} backend world={w} "
                       f"{s:9s} {'hole_segments' if holes else 'stock':13s} "
-                      f"max_err={e:.2e}", flush=True)
+                      f"{dense:10s} max_err={e:.2e}", flush=True)

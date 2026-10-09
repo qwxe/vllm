@@ -85,6 +85,9 @@ def _cp_comm() -> CPComm:
 
 class CPHolesBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16, torch.bfloat16, torch.float32
+    ]
     forward_includes_kv_cache_update: bool = True
 
     @staticmethod
@@ -260,8 +263,10 @@ class CPHolesImpl(AttentionImpl[CPHolesMetadata]):
         if attn_metadata is None:  # profiling run
             return output.fill_(0)
         md = attn_metadata
-        n = md.num_actual_tokens
         scheme = md.scheme
+        # sharded: the model runner fed this rank only its own rows
+        n = int(scheme.own_rows.numel()) if md.dense == "sharded" else \
+            md.num_actual_tokens
         q, k, v = query[:n], key[:n], value[:n]
         q = q.view(n, -1, self.head_size)
         k = k.view(n, -1, self.head_size)
@@ -300,11 +305,47 @@ def gather_rows(scheme, x_own: torch.Tensor, m: int) -> torch.Tensor:
     return out
 
 
-def shard_inputs(scheme, *tensors: torch.Tensor) -> list[torch.Tensor]:
+def sharded_scheme(attn_metadata):
+    """The step's CP_HOLES scheme if the sharded dense mode is active, else
+    None. `attn_metadata` is the model runner's per-layer dict."""
+    if not isinstance(attn_metadata, dict):
+        return None
+    for md in attn_metadata.values():
+        if isinstance(md, CPHolesMetadata):
+            return md.scheme if md.dense == "sharded" else None
+    return None
+
+
+def shard_inputs(scheme, *tensors):
     """Model-runner hook (sharded dense mode): keep the rank's own rows of
-    per-token inputs (input_ids, positions, ...)."""
-    own = scheme.own_rows
-    return [t[own.to(t.device)] for t in tensors]
+    per-token inputs (input_ids, positions, inputs_embeds; None passes)."""
+    out = []
+    for t in tensors:
+        out.append(None if t is None else t[scheme.own_rows.to(t.device)])
+    return out
+
+
+def gather_logits_hidden(scheme, hidden_own: torch.Tensor,
+                         logits_indices: torch.Tensor) -> torch.Tensor:
+    """Model-runner hook (sharded dense mode): the hidden states of the rows
+    the logits are taken at (each request's tail-last token), from whichever
+    rank owns them, on every rank.
+
+    Each logits row lives on exactly one rank; the others contribute zeros to
+    one all-reduce over the CP group (num_logits x hidden, small). Every rank
+    then computes the logits and samples exactly as without CP, so the
+    per-rank request state stays identical (as under TP).
+    """
+    own = scheme.own_rows.to(hidden_own.device)
+    li = logits_indices.to(hidden_own.device, torch.int64)
+    out = hidden_own.new_zeros((li.numel(), ) + tuple(hidden_own.shape[1:]))
+    if own.numel():
+        pos = torch.searchsorted(own, li).clamp(max=own.numel() - 1)
+        hit = own[pos] == li
+        out[hit] = hidden_own[pos[hit]]
+    if scheme.comm.world > 1:
+        dist.all_reduce(out, group=scheme.comm.group)
+    return out
 
 
 def register() -> None:
