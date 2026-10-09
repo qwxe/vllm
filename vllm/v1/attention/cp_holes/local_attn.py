@@ -209,10 +209,30 @@ _default_local_attn: Optional[LocalAttention] = None
 
 
 def get_local_attention() -> LocalAttention:
-    """The process-wide local attention backend (reference by default)."""
+    """The process-wide local attention (the holes/kernel adapter seam).
+
+    Chosen once from CP_HOLES_LOCAL_ATTN:
+    - "tiled" (default): TiledLocalAttention (PyTorch, GPU-usable);
+    - "ref": RefLocalAttention (dense per request, fp32);
+    - "module:attr": any callable with the LocalAttention signature, e.g. the
+      hole-aware kernel's adapter; `attr` may be a class (instantiated with no
+      arguments) or a function.
+    `set_local_attention()` overrides it.
+    """
     global _default_local_attn
     if _default_local_attn is None:
-        _default_local_attn = RefLocalAttention()
+        import importlib
+        import os
+        spec = os.environ.get("CP_HOLES_LOCAL_ATTN", "tiled")
+        if spec == "tiled":
+            fn = TiledLocalAttention()
+        elif spec == "ref":
+            fn = RefLocalAttention()
+        else:
+            mod, attr = spec.split(":")
+            obj = getattr(importlib.import_module(mod), attr)
+            fn = obj() if isinstance(obj, type) else obj
+        _default_local_attn = fn
     return _default_local_attn
 
 
