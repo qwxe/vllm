@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -237,6 +237,17 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # holes/core: req_id -> hole pieces [(start, end), ...] computed in this
+    # step, below the request's num_computed_tokens (sorted). Only requests
+    # with holes appear. For such a request num_scheduled_tokens[req_id] =
+    # sum of the piece lengths + the tail tokens; the tail is
+    # [num_computed_tokens, num_computed_tokens + n_tail). The model runner
+    # lays the request's tokens out as pieces in order, then the tail, and
+    # gives every piece its own attention segment.
+    scheduled_hole_ranges: dict[str, list[tuple[int, int]]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
