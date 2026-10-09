@@ -202,8 +202,16 @@ gpurun python gpu_holes_e2e.py --eager --dtype float32 --gpu-util 0.75   # Trito
 gpurun python gpu_holes_e2e.py --gpu-util 0.7                            # FA2, bf16, compiled
 python test_holes_plan.py; python test_holes_kv.py; python test_holes_segments.py   # CPU
 ```
-The GPU runs above used this branch's Python files overlaid on the venv's precompiled 0.19.0 binaries
-(`PYTHONPATH=<copy of site-packages/vllm with the patches>`); the files are identical to the commits.
+Rerun from this worktree (DEV.md recipe, `vllm.__file__` = `/home/asd/vllm-dev-wt/core/vllm/__init__.py`):
+CPU 13 + 10 + 3 PASS; GPU fp32/TRITON_ATTN eager PASS (8/8 tokens equal, dlp 0.0010-0.0070, stock noise
+0.0127) and bf16/FLASH_ATTN compiled + CUDA graphs PASS (8/8 tokens equal, dlp <= 0.125, stock noise 0.187),
+the same numbers as the first runs from the identical patched copy of the wheel.
+```
+cd tests/v1/holes
+env PYTHONPATH=/home/asd/vllm-dev-wt/core <venv>/bin/python test_holes_kv.py        # etc.
+gpurun env PYTHONPATH=/home/asd/vllm-dev-wt/core <venv>/bin/python gpu_holes_e2e.py --eager --dtype float32 --gpu-util 0.75
+gpurun env PYTHONPATH=/home/asd/vllm-dev-wt/core <venv>/bin/python gpu_holes_e2e.py --gpu-util 0.7
+```
 
 ## Not done / next
 - CPU-pool connector with `rate` eviction implementing `SupportsBlockHitMask` (async loads, layer-wise wait).
