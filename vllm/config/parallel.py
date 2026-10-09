@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
+CPKVPlacement = Literal["interleave", "head", "replicate"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 All2AllBackend = Literal[
@@ -302,6 +303,18 @@ class ParallelConfig:
     Block_size should be greater than or equal to cp_kv_cache_interleave_size.
     Block_size should be divisible by cp_kv_cache_interleave_size.
     """
+
+    cp_kv_placement: CPKVPlacement = "interleave"
+    """KV cache placement over the prefill context parallel (PCP) group.
+    - "interleave": vLLM's PCP placement. Positions are interleaved over the
+      PCP ranks by `cp_kv_cache_interleave_size`; a KV-manager block covers
+      block_size * pcp tokens (pass-Q / ring CP schemes).
+    - "head": every rank holds every position for a slice of the KV heads
+      (Ulysses; KV heads are replicated when pcp > num KV heads). The KV
+      cache spec is built with num_kv_heads / pcp heads (at least 1).
+    - "replicate": every rank holds the whole KV (all-gather KV CP).
+    With "head" and "replicate" the KV manager, slot mapping and capacity see
+    no PCP interleave (as for pcp = 1)."""
 
     data_parallel_index: int = Field(init=False)
     """Equal to the data parallel rank but not used for torch process groups
@@ -579,6 +592,14 @@ class ParallelConfig:
         # on global rank
         torch.distributed.all_reduce(tensor, op=ReduceOp.MIN, group=dp_group)
         return tensor.item()
+
+    @property
+    def kv_interleave_pcp_size(self) -> int:
+        """PCP ranks the KV positions are interleaved over (1 unless
+        `cp_kv_placement == "interleave"`)."""
+        if self.cp_kv_placement == "interleave":
+            return self.prefill_context_parallel_size
+        return 1
 
     def compute_hash(self):
         """

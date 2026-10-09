@@ -160,7 +160,8 @@ class Scheduler(SchedulerInterface):
 
         self.block_size = block_size
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        # KV-manager view of PCP: 1 unless positions are interleaved over it.
+        self.pcp_world_size = vllm_config.parallel_config.kv_interleave_pcp_size
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
@@ -319,7 +320,7 @@ class Scheduler(SchedulerInterface):
                 kv_cache_config.num_blocks // num_groups
             ) * min_block_size
             dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
-            pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+            pcp_size = self.vllm_config.parallel_config.kv_interleave_pcp_size
             if pcp_size * dcp_size > 1:
                 self.max_num_kv_tokens *= pcp_size * dcp_size
 

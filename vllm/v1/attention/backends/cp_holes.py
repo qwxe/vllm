@@ -31,10 +31,11 @@ KV placement:
   block_size = cp_kv_cache_interleave_size = u (KERNEL-ALGO 4.0 wants
   u = 128). The KV manager then treats a logical block as block_size * d
   tokens, exactly the interleave the schemes assume.
-- ulysses (head slices of every position) and allgather (replicated) need the
-  KV manager to NOT multiply the block size by the PCP size; ulysses also
-  needs the KV cache spec built with Hkv / d heads (Hkv replicated over d / Hkv
-  ranks when d > Hkv). Both are small core patches, listed in CP-IMPL.md.
+- ulysses runs with `--cp-kv-placement head` (head slices of every position;
+  the KV cache spec has Hkv / d heads, 1 replicated head when d > Hkv) and
+  allgather with `--cp-kv-placement replicate`. With either, the KV manager,
+  slot mapping and capacity see no PCP interleave (ParallelConfig.
+  kv_interleave_pcp_size == 1).
 
 Hole ranges come from holes/core: `common_attn_metadata.hole_segments`
 (`vllm.v1.worker.hole_segments.HoleSegments`), see `request_segments`. A step
@@ -64,6 +65,14 @@ from vllm.v1.attention.cp_holes.kv_store import (PagedKVStore,
 from vllm.v1.attention.cp_holes.schemes import PASSQ_RATIO, CPComm
 
 _POSITION_SHARDED = ("passq", "ring", "adaptive")
+# ParallelConfig.cp_kv_placement each scheme's KV layout requires.
+REQUIRED_PLACEMENT = {
+    "ulysses": "head",
+    "allgather": "replicate",
+    "passq": "interleave",
+    "ring": "interleave",
+    "adaptive": "interleave",
+}
 
 
 def _cp_comm() -> CPComm:
@@ -133,6 +142,12 @@ class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
         self.ratio = float(os.environ.get("VLLM_CP_HOLES_PASSQ_RATIO",
                                           PASSQ_RATIO))
         self.n_mb = int(os.environ.get("VLLM_CP_HOLES_MB", "2"))
+        if self.comm.world > 1:
+            want = REQUIRED_PLACEMENT[self.scheme_name]
+            got = getattr(pc, "cp_kv_placement", "interleave")
+            assert got == want, (
+                f"CP_HOLES scheme {self.scheme_name} needs "
+                f"--cp-kv-placement {want}, got {got}")
         if self.scheme_name in _POSITION_SHARDED and self.comm.world > 1:
             assert self.block_size == self.interleave, (
                 "CP_HOLES position-sharded schemes need block_size == "

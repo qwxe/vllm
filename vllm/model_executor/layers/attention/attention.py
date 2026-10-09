@@ -551,9 +551,18 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
+            num_kv_heads = self.num_kv_heads
+            pc = vllm_config.parallel_config
+            if pc.cp_kv_placement == "head":
+                # Ulysses: each PCP rank stores a slice of the KV heads.
+                from vllm.v1.worker.cp_utils import cp_kv_heads_per_rank
+
+                num_kv_heads = cp_kv_heads_per_rank(
+                    num_kv_heads, pc.prefill_context_parallel_size
+                )
             return FullAttentionSpec(
                 block_size=block_size,
-                num_kv_heads=self.num_kv_heads,
+                num_kv_heads=num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,

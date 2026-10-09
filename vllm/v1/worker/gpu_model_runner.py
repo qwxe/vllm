@@ -184,6 +184,7 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
+    set_cp_kv_placement,
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
@@ -613,6 +614,7 @@ class GPUModelRunner(
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        set_cp_kv_placement(self.parallel_config.cp_kv_placement)
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -6900,7 +6902,7 @@ class GPUModelRunner(
             self.kv_cache_config.num_blocks // num_groups
         ) * min_block_size
         dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
-        pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+        pcp_size = self.vllm_config.parallel_config.kv_interleave_pcp_size
         if pcp_size * dcp_size > 1:
             self.max_num_kv_tokens *= pcp_size * dcp_size
 

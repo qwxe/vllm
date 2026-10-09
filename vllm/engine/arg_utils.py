@@ -420,6 +420,7 @@ class EngineArgs:
     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int = ParallelConfig.cp_kv_cache_interleave_size
+    cp_kv_placement: str = ParallelConfig.cp_kv_placement
     data_parallel_size: int = ParallelConfig.data_parallel_size
     data_parallel_rank: int | None = None
     data_parallel_start_rank: int | None = None
@@ -864,6 +865,10 @@ class EngineArgs:
         parallel_group.add_argument(
             "--cp-kv-cache-interleave-size",
             **parallel_kwargs["cp_kv_cache_interleave_size"],
+        )
+        parallel_group.add_argument(
+            "--cp-kv-placement",
+            **parallel_kwargs["cp_kv_placement"],
         )
         parallel_group.add_argument(
             "--prefill-context-parallel-size",
@@ -1797,6 +1802,7 @@ class EngineArgs:
             dcp_comm_backend=self.dcp_comm_backend,
             dcp_kv_cache_interleave_size=self.dcp_kv_cache_interleave_size,
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            cp_kv_placement=self.cp_kv_placement,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
         )

@@ -43,12 +43,47 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
                 )
 
 
-def get_total_cp_world_size():
+# KV placement over the PCP group (ParallelConfig.cp_kv_placement). Set by the
+# model runner in each worker; "head" / "replicate" mean the KV positions are
+# not interleaved over PCP, so slot mapping and block counts ignore PCP.
+_CP_KV_PLACEMENT = "interleave"
+
+
+def set_cp_kv_placement(placement: str) -> None:
+    global _CP_KV_PLACEMENT
+    assert placement in ("interleave", "head", "replicate"), placement
+    _CP_KV_PLACEMENT = placement
+
+
+def get_cp_kv_placement() -> str:
+    return _CP_KV_PLACEMENT
+
+
+def get_kv_pcp_world_size_and_rank() -> tuple[int, int]:
+    """(world size, rank) of the PCP group as seen by the KV layout."""
+    if _CP_KV_PLACEMENT != "interleave":
+        return 1, 0
     try:
-        pcp_world_size = get_pcp_group().world_size
+        return get_pcp_group().world_size, get_pcp_group().rank_in_group
     except AssertionError:
         # PCP might not be initialized in testing
-        pcp_world_size = 1
+        return 1, 0
+
+
+def cp_kv_heads_per_rank(num_kv_heads: int, pcp_world_size: int) -> int:
+    """KV heads stored per rank under the "head" placement (Ulysses):
+    num_kv_heads / pcp, or 1 (replicated heads) when pcp > num_kv_heads."""
+    if pcp_world_size <= 1:
+        return num_kv_heads
+    if pcp_world_size <= num_kv_heads:
+        assert num_kv_heads % pcp_world_size == 0, (num_kv_heads, pcp_world_size)
+        return num_kv_heads // pcp_world_size
+    assert pcp_world_size % num_kv_heads == 0, (num_kv_heads, pcp_world_size)
+    return 1
+
+
+def get_total_cp_world_size():
+    pcp_world_size, _ = get_kv_pcp_world_size_and_rank()
     try:
         dcp_world_size = get_dcp_group().world_size
     except AssertionError:

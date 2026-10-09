@@ -4,13 +4,16 @@
 import numpy as np
 import torch
 
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_dcp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
+from vllm.v1.worker.cp_utils import (
+    get_kv_pcp_world_size_and_rank,
+    get_total_cp_world_size,
+)
 
 logger = init_logger(__name__)
 
@@ -83,13 +86,9 @@ class BlockTable:
         else:
             self._kernel_block_arange = None
 
-        try:
-            self.pcp_world_size = get_pcp_group().world_size
-            self.pcp_rank = get_pcp_group().rank_in_group
-        except AssertionError:
-            # PCP might not be initialized in testing
-            self.pcp_world_size = 1
-            self.pcp_rank = 0
+        # PCP as seen by the KV layout (1 / 0 unless positions are
+        # interleaved over PCP; see ParallelConfig.cp_kv_placement).
+        self.pcp_world_size, self.pcp_rank = get_kv_pcp_world_size_and_rank()
         try:
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group

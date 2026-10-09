@@ -1305,7 +1305,7 @@ def _report_kv_cache_config(
         * min_block_size
     )
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
-    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+    pcp_size = vllm_config.parallel_config.kv_interleave_pcp_size
     if pcp_size * dcp_size > 1:
         num_tokens *= pcp_size * dcp_size
         logger.info(
