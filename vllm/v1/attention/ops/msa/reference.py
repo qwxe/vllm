@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Synced from the standalone repo /home/asd/vllm-dev-kernels (msa/).
+# Synced from the standalone MSA kernel repo (its msa/ package).
 """Pure-PyTorch reference for position-explicit paged attention (fp32 math)."""
 
 import math

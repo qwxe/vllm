@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Synced from the standalone repo /home/asd/vllm-dev-kernels (msa/).
+# Synced from the standalone MSA kernel repo (its msa/ package).
 """MSA: position-explicit multi-segment paged attention (hole-aware prefill / CP local kernel)."""
 
 from .api import merge_states, msa, msa_attention
