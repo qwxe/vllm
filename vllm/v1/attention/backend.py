@@ -367,6 +367,12 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
+    hole_segments: Any = None
+    """holes/core: when a request of the step has holes, every "request" of
+    this metadata is a segment (hole piece or tail); this is the
+    vllm.v1.worker.hole_segments.HoleSegments view mapping segments back to
+    requests (seg_req_idx) with their positions. None otherwise."""
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None

@@ -120,6 +120,11 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.worker.hole_segments import (
+    HoleSegments,
+    build_hole_segments,
+    segment_common_attn_metadata,
+)
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
@@ -682,6 +687,9 @@ class GPUModelRunner(
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # holes/core: segment view of the step being prepared (None when no
+        # request of the step has holes).
+        self._hole_segments: HoleSegments | None = None
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -1819,6 +1827,23 @@ class GPUModelRunner(
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
 
+        # holes/core: requests with holes compute hole pieces below their
+        # frontier plus a tail; rewrite their positions and build the
+        # per-segment view used for the attention metadata.
+        hole_segments: HoleSegments | None = None
+        if scheduler_output.scheduled_hole_ranges:
+            assert not self.uses_mrope and self.uses_xdrope_dim == 0, (
+                "holes are not supported with M-RoPE / XD-RoPE"
+            )
+            hole_segments = build_hole_segments(
+                self.input_batch.req_ids,
+                scheduler_output.scheduled_hole_ranges,
+                num_scheduled_tokens,
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                positions_np,
+            )
+        self._hole_segments = hole_segments
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1913,6 +1938,12 @@ class GPUModelRunner(
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        if hole_segments is not None:
+            # A request's sequence ends at its tail's end; hole pieces lie
+            # below the frontier.
+            self.optimistic_seq_lens_cpu[:num_reqs] -= torch.from_numpy(
+                hole_segments.req_hole_tokens
+            )
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
@@ -2001,6 +2032,15 @@ class GPUModelRunner(
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
+        if hole_segments is not None:
+            # holes/core: explicit positions (pieces, then tail) and
+            # request-level seq_lens ending at the tail.
+            self.positions[:total_num_scheduled_tokens].copy_(
+                torch.from_numpy(positions_np).to(torch.int64), non_blocking=False
+            )
+            self.seq_lens[:num_reqs] -= torch.from_numpy(
+                hole_segments.req_hole_tokens
+            ).to(self.device)
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
@@ -2106,6 +2146,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        hole_segments: HoleSegments | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2191,6 +2232,11 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
         )
+        if hole_segments is not None:
+            # holes/core: one varlen entry per segment (KERNEL-ALGO (a)).
+            assert ubatch_slices is None and num_reqs_padded == num_reqs
+            assert len(kv_cache_groups) == 1 and self.dcp_world_size == 1
+            cm_base = segment_common_attn_metadata(cm_base, hole_segments, self.device)
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -3861,8 +3907,15 @@ class GPUModelRunner(
             )
 
             cascade_attn_prefix_lens = None
+            hole_segments = self._hole_segments
+            self._hole_segments = None
             # Disable cascade attention when using microbatching (DBO)
-            if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
+            # holes/core: and for steps with holes (segment-level metadata).
+            if (
+                self.cascade_attn_enabled
+                and not self.parallel_config.use_ubatching
+                and hole_segments is None
+            ):
                 # Pre-compute cascade attention prefix lengths
                 cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
                     num_scheduled_tokens_np,
@@ -3881,7 +3934,10 @@ class GPUModelRunner(
                 num_reqs=num_reqs,
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
-                use_cascade_attn=cascade_attn_prefix_lens is not None,
+                # holes/core: no FULL cudagraph / microbatching with holes.
+                use_cascade_attn=cascade_attn_prefix_lens is not None
+                or hole_segments is not None,
+                allow_microbatching=hole_segments is None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
@@ -3979,6 +4035,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    hole_segments=hole_segments,
                 )
             )
 

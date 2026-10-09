@@ -25,6 +25,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.hole_mask import (
+    SupportsBlockHitMask,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -35,6 +38,12 @@ from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
+)
+from vllm.v1.core.holes import (
+    get_hole_config,
+    plan_step,
+    range_tokens,
+    subtract_ranges,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -221,6 +230,9 @@ class Scheduler(SchedulerInterface):
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
 
+        # holes/core: hole-aware prefix caching (off by default).
+        self.hole_config = get_hole_config(vllm_config)
+
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
@@ -233,6 +245,7 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
+            hole_config=self.hole_config,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -246,6 +259,28 @@ class Scheduler(SchedulerInterface):
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
+
+        # holes/core: holes need the V1 GPU model runner; a KV connector must
+        # implement SupportsBlockHitMask, otherwise it keeps prefix semantics
+        # and holes are off.
+        self.holes_enabled = self.kv_cache_manager.holes_enabled
+        if self.holes_enabled and self.use_v2_model_runner:
+            logger.warning("Holes are not supported by the V2 model runner.")
+            self.holes_enabled = False
+        if (
+            self.holes_enabled
+            and self.connector is not None
+            and not isinstance(self.connector, SupportsBlockHitMask)
+        ):
+            logger.warning(
+                "Holes disabled: KV connector %s does not implement "
+                "SupportsBlockHitMask.",
+                type(self.connector).__name__,
+            )
+            self.holes_enabled = False
+        self._warned_async_mask = False
+        self._step_hole_ranges: dict[str, list[tuple[int, int]]] = {}
+        self._extra_segments = 0
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -364,6 +399,11 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        # holes/core: req_id -> hole pieces computed in this step.
+        scheduled_hole_ranges: dict[str, list[tuple[int, int]]] = {}
+        # Attention-metadata entries beyond one per request (extra hole
+        # pieces); total entries stay <= max_num_seqs.
+        self._extra_segments = 0
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -401,20 +441,37 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            hole_pieces: list[tuple[int, int]] = []
+            if request.pending_hole_ranges:
+                # holes/core: the request still has holes to compute.
+                # Its work is the pending holes (front first), then the tail.
+                hole_pieces, n_tail = self._plan_hole_step(
+                    request,
+                    request.num_computed_tokens,
+                    token_budget,
+                    num_entries=len(self.running),
+                )
+                num_new_tokens = range_tokens(hole_pieces) + n_tail
+            else:
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
+                if (
+                    0
+                    < self.scheduler_config.long_prefill_token_threshold
+                    < num_new_tokens
+                ):
+                    num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                num_new_tokens = min(num_new_tokens, token_budget)
 
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
-            )
+                # Make sure the input position does not exceed the max model len.
+                # This is necessary when using spec decoding.
+                num_new_tokens = min(
+                    num_new_tokens,
+                    self.max_model_len - 1 - request.num_computed_tokens,
+                )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -462,8 +519,9 @@ class Scheduler(SchedulerInterface):
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
-                        num_new_tokens,
+                        num_new_tokens - range_tokens(hole_pieces),
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        hole_ranges=hole_pieces or None,
                     )
 
                     if new_blocks is not None:
@@ -483,6 +541,7 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_hole_ranges.pop(preempted_req_id, None)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
@@ -514,6 +573,9 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if hole_pieces:
+                scheduled_hole_ranges[request_id] = hole_pieces
+                self._extra_segments += len(hole_pieces) - (n_tail == 0)
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -606,8 +668,49 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
+                # holes/core: holes found by the lookup (to recompute) and
+                # connector-loaded ranges of this admission.
+                new_holes: list[tuple[int, int]] = []
+                load_ranges: list[tuple[int, int]] = []
+                hole_mode = (
+                    self.holes_enabled
+                    and request.num_computed_tokens == 0
+                    and not request.has_encoder_inputs
+                )
+
                 # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
+                if hole_mode:
+                    ext_mask = None
+                    if self.connector is not None:
+                        assert isinstance(self.connector, SupportsBlockHitMask)
+                        local, _ = self.kv_cache_manager.get_cache_hits_with_holes(
+                            request
+                        )
+                        ext_mask, mask_async = self.connector.get_block_hit_mask(
+                            request, [b is not None for b in local]
+                        )
+                        if ext_mask is None:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        if mask_async:
+                            if not self._warned_async_mask:
+                                logger.warning(
+                                    "Asynchronous block-mask loads are not "
+                                    "supported yet; treating them as misses."
+                                )
+                                self._warned_async_mask = True
+                            ext_mask = None
+                    (
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                        new_holes,
+                        load_ranges,
+                    ) = self.kv_cache_manager.get_computed_blocks_with_holes(
+                        request, ext_mask
+                    )
+                    num_computed_tokens = num_new_local_computed_tokens
+                elif request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
@@ -653,10 +756,33 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
 
+                hole_pieces = []
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
+                elif new_holes:
+                    # holes/core: holes front first, then the tail (5.2 rules).
+                    request.pending_hole_ranges = new_holes
+                    hole_pieces, n_tail = self._plan_hole_step(
+                        request,
+                        num_computed_tokens,
+                        token_budget,
+                        num_entries=len(self.running) + 1,
+                    )
+                    request.pending_hole_ranges = []
+                    num_new_tokens = range_tokens(hole_pieces) + n_tail
+                    if (
+                        not self.scheduler_config.enable_chunked_prefill
+                        and range_tokens(new_holes)
+                        + request.num_tokens
+                        - num_computed_tokens
+                        > token_budget
+                    ):
+                        break
+                    if num_new_tokens == 0:
+                        # Not enough budget for a rule-conforming chunk.
+                        break
                 else:
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
@@ -745,13 +871,14 @@ class Scheduler(SchedulerInterface):
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens,
+                    num_new_tokens - range_tokens(hole_pieces),
                     num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    hole_ranges=hole_pieces or None,
                 )
 
                 if new_blocks is None:
@@ -767,7 +894,17 @@ class Scheduler(SchedulerInterface):
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
                 # needed for this request.
-                if self.connector is not None:
+                if self.connector is not None and hole_mode:
+                    # holes/core: the connector loads block ranges into the
+                    # blocks allocated in place; they are cached now (sync
+                    # load before the forward, as for stock external tokens).
+                    self.kv_cache_manager.cache_hole_blocks(request, load_ranges)
+                    self.connector.update_state_after_alloc_with_ranges(  # type: ignore[union-attr]
+                        request,
+                        self.kv_cache_manager.get_blocks(request_id),
+                        load_ranges,
+                    )
+                elif self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
@@ -826,9 +963,16 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if new_holes:
+                    request.pending_hole_ranges = new_holes
+                    if hole_pieces:
+                        scheduled_hole_ranges[request_id] = hole_pieces
+                        self._extra_segments += len(hole_pieces) - (n_tail == 0)
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
-                    request.num_cached_tokens = num_computed_tokens
+                    request.num_cached_tokens = num_computed_tokens - range_tokens(
+                        new_holes
+                    )
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -892,6 +1036,7 @@ class Scheduler(SchedulerInterface):
                 for req in scheduled_new_reqs
             ]
 
+        self._step_hole_ranges = scheduled_hole_ranges
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
@@ -927,6 +1072,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            scheduled_hole_ranges=scheduled_hole_ranges,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -948,6 +1094,45 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
+    def _plan_hole_step(
+        self,
+        request: Request,
+        frontier: int,
+        token_budget: int,
+        num_entries: int,
+    ) -> tuple[list[tuple[int, int]], int]:
+        """holes/core: pick the hole pieces and tail tokens of a request with
+        pending holes for this step (KERNEL-ALGO 5.2)."""
+        cfg = self.hole_config
+        budget = token_budget
+        if cfg.step_budget > 0:
+            budget = min(budget, cfg.step_budget)
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if threshold > 0:
+            budget = min(budget, threshold)
+        # Every running request may get one entry; this request's pieces
+        # beyond its own entry must fit in what is left of max_num_seqs.
+        max_segments = 1 + max(
+            0, self.max_num_running_reqs - num_entries - self._extra_segments
+        )
+        return plan_step(
+            request.pending_hole_ranges,
+            frontier,
+            request.num_tokens,
+            budget,
+            token_budget,
+            cfg,
+            max_segments=max_segments,
+        )
+
+    def holes_evict_token_range(self, request: Request, start: int, end: int) -> int:
+        """holes/core test hook: evict the cached blocks of ``request``'s
+        prompt in [start, end) from the GPU prefix cache, creating a hole for
+        the next request with the same prefix. ``request`` only needs
+        ``block_hashes`` (it need not be scheduled)."""
+        assert self.hole_config.test_hooks, "enable holes test_hooks"
+        return self.kv_cache_manager.evict_cached_token_range(request, start, end)
+
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -966,6 +1151,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.pending_hole_ranges = []
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -986,8 +1172,16 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        hole_ranges = scheduler_output.scheduled_hole_ranges
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            if hole_ranges and (pieces := hole_ranges.get(req_id)):
+                # holes/core: hole pieces lie below the frontier; only the
+                # tail tokens advance num_computed_tokens.
+                num_scheduled_token -= range_tokens(pieces)
+                request.pending_hole_ranges = subtract_ranges(
+                    request.pending_hole_ranges, pieces
+                )
             request.num_computed_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
@@ -1081,8 +1275,10 @@ class Scheduler(SchedulerInterface):
                 # stage worker and the last-stage worker. Otherwise, we don't
                 # need to send the sampled tokens back because the model runner
                 # will cache them.
-                num_tokens = num_scheduled_tokens[req_id] - len(
-                    spec_decode_tokens.get(req_id, ())
+                num_tokens = (
+                    num_scheduled_tokens[req_id]
+                    - len(spec_decode_tokens.get(req_id, ()))
+                    - range_tokens(self._step_hole_ranges.get(req_id))
                 )
                 token_ids = req.all_token_ids[
                     req.num_computed_tokens : req.num_computed_tokens + num_tokens

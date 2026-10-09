@@ -133,6 +133,11 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # holes/core: token ranges below num_computed_tokens whose KV is
+        # missing and still has to be computed (sorted, block aligned).
+        # num_computed_tokens is the tail frontier; the tokens in these
+        # ranges are not computed even though they lie below it.
+        self.pending_hole_ranges: list[tuple[int, int]] = []
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

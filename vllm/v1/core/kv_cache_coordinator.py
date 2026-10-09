@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -188,6 +189,38 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.cache_blocks(request, num_computed_tokens)
 
+    # ---- holes/core ----------------------------------------------------
+    # Hole-aware lookup is implemented for a single full-attention KV cache
+    # group (UnitaryKVCacheCoordinator); other layouts report no support and
+    # keep the stock prefix-only lookup.
+    supports_holes: bool = False
+
+    def find_cache_hits_with_holes(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+    ) -> list[list[KVCacheBlock] | None]:
+        raise NotImplementedError
+
+    def allocate_new_computed_blocks_with_holes(
+        self,
+        request_id: str,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+    ) -> int:
+        """Add a new request's hits (null blocks mark holes) and allocate the
+        hole blocks in place. Returns the number of hole blocks."""
+        n = 0
+        for i, manager in enumerate(self.single_type_managers):
+            n = manager.allocate_new_computed_blocks_with_holes(
+                request_id, new_computed_blocks[i]
+            )
+        return n
+
+    def cache_hole_blocks(self, request: Request, ranges: list[tuple[int, int]]) -> None:
+        """Cache the hole blocks covered by the scheduled token ranges."""
+        for manager in self.single_type_managers:
+            manager.cache_hole_blocks(request, ranges)
+
     def free(self, request_id: str) -> None:
         """
         Free the blocks for the request.
@@ -344,6 +377,29 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         )
         assert len(self.kv_cache_config.kv_cache_groups) == 1, (
             "UnitaryKVCacheCoordinator assumes only one kv cache group"
+        )
+
+        self.supports_holes = (
+            enable_caching
+            and not use_eagle
+            and dcp_world_size == 1
+            and pcp_world_size == 1
+            and type(self.kv_cache_spec) is FullAttentionSpec
+            and type(self.single_type_managers[0]) is FullAttentionManager
+        )
+
+    def find_cache_hits_with_holes(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+    ) -> list[list[KVCacheBlock] | None]:
+        assert self.supports_holes
+        return self.single_type_managers[0].find_cache_hits_with_holes(  # type: ignore[attr-defined]
+            block_hashes=block_hashes,
+            max_length=max_cache_hit_length,
+            kv_cache_group_ids=[0],
+            block_pool=self.block_pool,
+            kv_cache_spec=self.kv_cache_spec,
         )
 
     def find_longest_cache_hit(
