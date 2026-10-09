@@ -312,6 +312,17 @@ class SchedulerOutput:
     # Kept for out-of-tree schedulers and workers.
     num_common_prefix_blocks: list[int] = field(default_factory=list)
 
+    # holes/core: req_id -> hole pieces [(start, end), ...] computed in this
+    # step, below the request's num_computed_tokens (sorted). Only requests
+    # with holes appear. For such a request num_scheduled_tokens[req_id] =
+    # sum of the piece lengths + the tail tokens; the tail is
+    # [num_computed_tokens, num_computed_tokens + n_tail). The model runner
+    # lays the request's tokens out as pieces in order, then the tail, and
+    # gives every piece its own attention segment.
+    scheduled_hole_ranges: dict[str, list[tuple[int, int]]] = field(
+        default_factory=dict
+    )
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
