@@ -57,8 +57,8 @@ def layout(name: str, E: int, m: int) -> list[list[tuple[int, int]]]:
                  (the `rate` hole anatomy, KERNEL-ALGO section 1)
     tail:        cached prefix, a tail chunk of m tokens at E (no hole)
     fresh:       a fresh prefill of m tokens from 0
-    deep_small:  one 16-token piece at E/2 + a tail of m - 16 at E
-    tiny8:       8 pieces of 64 tokens within 1K of E/2 + the tail
+    deep_small:  one 16-token piece at E/4 + a tail of m - 16 at E
+    tiny8:       8 pieces of 64 tokens within 1K of E/4 + the tail
     hole_only:   a hole step that does not reach the tail (m tokens at 7.5K)
     multi:       4 requests of E/4 context, each a tail of m/4
     """
@@ -70,9 +70,9 @@ def layout(name: str, E: int, m: int) -> list[list[tuple[int, int]]]:
     if name == "fresh":
         return [[(0, m)]]
     if name == "deep_small":
-        return [[(E // 2, 16), (E - (m - 16), m - 16)]]
+        return [[(E // 4, 16), (E - (m - 16), m - 16)]]
     if name == "tiny8":
-        p = [(E // 2 + 128 * i, 64) for i in range(8)]
+        p = [(E // 4 + 128 * i, 64) for i in range(8)]
         return [p + [(E - (m - 512), m - 512)]]
     if name == "hole_only":
         return [[(7500, m)]]
