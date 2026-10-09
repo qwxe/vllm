@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """holes/rate GPU end-to-end: a multi-turn session workload, LRU vs rate.
 
 One engine per process (one arm per invocation), through ``gpurun``:
 
-    python gpu_rate_e2e.py workload --out DIR            # CPU: build the workload
+    python gpu_rate_e2e.py workload --dataset JSONL --out DIR  # CPU: build the workload
     python gpu_rate_e2e.py calib --out DIR               # fit the cost line (GPU)
     python gpu_rate_e2e.py run --arm big  --out DIR      # reference, no eviction
     python gpu_rate_e2e.py run --arm lru  --out DIR      # small cache, stock LRU
@@ -26,10 +27,6 @@ import statistics
 import sys
 import time
 
-CODEX = (
-    "/home/asd/LLMServingSim/outputs/pe_mc/srpt_20261002/tracelab/explore/infra/ds/"
-    "codex_n100_s400_k600_seed0.jsonl"
-)
 MODEL = os.environ.get("TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 
 
@@ -41,7 +38,7 @@ def make_workload(args):
     sessions = []
     gaps_all = []
     n_req = 0
-    with open(CODEX) as f:
+    with open(args.dataset) as f:
         for i, line in enumerate(f):
             d = json.loads(line)
             subs = d["sub_requests"]
@@ -348,6 +345,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["workload", "calib", "run", "report"])
     ap.add_argument("--out", required=True)
+    ap.add_argument(
+        "--dataset",
+        default=os.environ.get("RATE_E2E_DATASET"),
+        help="agentic session JSONL (sub_requests with input_toks / output_toks / "
+        "tool_duration_ns), e.g. TraceLab codex_n100_s400_k600_seed0.jsonl; "
+        "required by `workload`, also read from $RATE_E2E_DATASET",
+    )
     ap.add_argument("--arm", choices=["big", "lru", "rate"], default="rate")
     ap.add_argument("--sessions", type=int, default=24)
     ap.add_argument("--max-turns", type=int, default=10)
@@ -365,6 +369,8 @@ def main():
     ap.add_argument("--big-blocks", type=int, default=0, help="0 = all that fit")
     ap.add_argument("--paper-cost", action="store_true")
     args = ap.parse_args()
+    if args.cmd == "workload" and not args.dataset:
+        ap.error("workload needs --dataset (or $RATE_E2E_DATASET)")
     {"workload": make_workload, "calib": calib, "run": run, "report": report}[args.cmd](args)
 
 
