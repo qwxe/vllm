@@ -60,6 +60,9 @@ from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
 from vllm.v1.attention.cp_holes import StepPlan, make_scheme
 from vllm.v1.attention.cp_holes.comm import (all_gather_bytes, pack_rows,
                                              unpack_rows)
+from vllm.v1.attention.cp_holes.local_attn import (AutoLocalAttention,
+                                                   get_local_attention,
+                                                   msa_available)
 from vllm.v1.attention.cp_holes.kv_store import (PagedKVStore,
                                                  vllm_local_layout)
 from vllm.v1.attention.cp_holes.schemes import PASSQ_RATIO, CPComm
@@ -126,6 +129,10 @@ class CPHolesMetadata:
     local_pos: list[torch.Tensor]
     present: list[torch.Tensor]
     dense: str
+    # paged in-place attention with MSA, and the per-step cache shared by
+    # all layers (block tables, kblk_pos, MSA plans)
+    in_place: bool = False
+    step_cache: Optional[dict] = None
 
 
 class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
@@ -145,6 +152,20 @@ class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
         self.ratio = float(os.environ.get("VLLM_CP_HOLES_PASSQ_RATIO",
                                           PASSQ_RATIO))
         self.n_mb = int(os.environ.get("VLLM_CP_HOLES_MB", "2"))
+        # Ulysses / pass-Q read the paged cache in place with MSA when the
+        # local attention is MSA-backed (CP_HOLES_LOCAL_ATTN auto / msa).
+        la = get_local_attention()
+        self.in_place = (
+            os.environ.get("CP_HOLES_PAGED", "1") == "1"
+            and msa_available()
+            and (isinstance(la, AutoLocalAttention)
+                 or type(la).__name__ == "MsaLocalAttention"))
+        from vllm.logger import init_logger
+        init_logger(__name__).info(
+            "CP_HOLES: scheme=%s dense=%s cp=%d/%d local_attn=%s "
+            "paged_in_place=%s", self.scheme_name, self.dense,
+            self.comm.rank, self.comm.world, type(la).__name__,
+            self.in_place)
         if self.comm.world > 1:
             want = REQUIRED_PLACEMENT[self.scheme_name]
             got = getattr(pc, "cp_kv_placement", "interleave")
@@ -193,7 +214,8 @@ class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
                                plan=plan, scheme=scheme, block_tables=tables,
                                local_pos=lpos, present=present,
-                               dense=self.dense)
+                               dense=self.dense, in_place=self.in_place,
+                               step_cache={})
 
 
 def kv_slot_validity(local_pos: torch.Tensor, e: int,
@@ -302,7 +324,8 @@ class CPHolesImpl(AttentionImpl[CPHolesMetadata]):
         k = k.view(n, -1, self.head_size)
         v = v.view(n, -1, self.head_size)
         store = PagedKVStore(kv_cache, md.block_tables, md.local_pos,
-                             md.present)
+                             md.present, in_place=md.in_place,
+                             step_cache=md.step_cache)
         out = output[:n].view(n, -1, self.head_size)
         if md.dense == "sharded":
             out.copy_(scheme.forward(q, k, v, store, self.scale))

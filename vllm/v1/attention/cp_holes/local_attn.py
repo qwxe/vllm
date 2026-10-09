@@ -208,11 +208,43 @@ class RefLocalAttention:
 _default_local_attn: Optional[LocalAttention] = None
 
 
+def msa_available() -> bool:
+    try:
+        import vllm.v1.attention.ops.msa  # noqa: F401
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+class AutoLocalAttention:
+    """MSA for CUDA inputs (the hole-aware Triton kernel), the tiled PyTorch
+    implementation for CPU inputs (gloo tests)."""
+
+    def __init__(self):
+        self.msa = None
+        self.tiled = TiledLocalAttention()
+
+    def __call__(self, q, qpos, qreq, keys, scale):
+        if q.is_cuda and msa_available():
+            if self.msa is None:
+                from vllm.v1.attention.ops.msa import MsaLocalAttention
+                self.msa = MsaLocalAttention(mode="auto")
+            return self.msa(q, qpos, qreq, keys, scale)
+        return self.tiled(q, qpos, qreq, keys, scale)
+
+    @property
+    def uses_msa(self) -> bool:
+        return msa_available()
+
+
 def get_local_attention() -> LocalAttention:
     """The process-wide local attention (the holes/kernel adapter seam).
 
     Chosen once from CP_HOLES_LOCAL_ATTN:
-    - "tiled" (default): TiledLocalAttention (PyTorch, GPU-usable);
+    - "auto" (default): MSA (holes/kernel `MsaLocalAttention`) for CUDA
+      tensors, TiledLocalAttention otherwise;
+    - "msa": MsaLocalAttention always (CUDA only);
+    - "tiled": TiledLocalAttention (PyTorch, GPU-usable);
     - "ref": RefLocalAttention (dense per request, fp32);
     - "module:attr": any callable with the LocalAttention signature, e.g. the
       hole-aware kernel's adapter; `attr` may be a class (instantiated with no
@@ -223,8 +255,13 @@ def get_local_attention() -> LocalAttention:
     if _default_local_attn is None:
         import importlib
         import os
-        spec = os.environ.get("CP_HOLES_LOCAL_ATTN", "tiled")
-        if spec == "tiled":
+        spec = os.environ.get("CP_HOLES_LOCAL_ATTN", "auto")
+        if spec == "auto":
+            fn = AutoLocalAttention()
+        elif spec == "msa":
+            from vllm.v1.attention.ops.msa import MsaLocalAttention
+            fn = MsaLocalAttention(mode="auto")
+        elif spec == "tiled":
             fn = TiledLocalAttention()
         elif spec == "ref":
             fn = RefLocalAttention()

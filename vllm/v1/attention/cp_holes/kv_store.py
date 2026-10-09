@@ -16,7 +16,7 @@ per-request local block tables and local position maps).
 
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from typing import Optional, Protocol, Sequence
 
 import torch
 
@@ -87,12 +87,83 @@ class PagedKVStore:
     def __init__(self, kv_cache: torch.Tensor,
                  block_table: Sequence[torch.Tensor],
                  local_pos: Sequence[torch.Tensor],
-                 present: Sequence[torch.Tensor]):
+                 present: Sequence[torch.Tensor],
+                 in_place: bool = False,
+                 step_cache: Optional[dict] = None):
         self.kv_cache = kv_cache
         self.block_table = block_table
         self.local_pos = local_pos
         self.present = [p.clone() for p in present]
         self.block_size = kv_cache.shape[2]
+        # in_place: attend() reads the paged cache with MSA (no gather).
+        # step_cache: per-step state shared by all layers (tables, plans).
+        self.in_place = in_place
+        self.step_cache = {} if step_cache is None else step_cache
+
+    def _msa_tables(self):
+        """Block table [R, max_blocks] and per-block start positions
+        (`kblk_pos`, int32; 2^30 for blocks past the request's end) for MSA's
+        paged mode 1, built once per step."""
+        t = self.step_cache.get("msa_tables")
+        if t is None:
+            bs = self.block_size
+            R = len(self.block_table)
+            maxb = max(1, max(int(b.numel()) for b in self.block_table))
+            dev = self.kv_cache.device
+            bt = torch.zeros(R, maxb, dtype=torch.int32)
+            kb = torch.full((R, maxb), 1 << 30, dtype=torch.int32)
+            lp_cpu = []
+            for r in range(R):
+                b = self.block_table[r].cpu()
+                bt[r, :b.numel()] = b.to(torch.int32)
+                lp = self.local_pos[r].cpu()
+                lp_cpu.append(lp)
+                first = lp[::bs][:maxb]
+                kb[r, :first.numel()] = torch.where(
+                    first >= 0, first, torch.full_like(first, 1 << 30)).to(
+                        torch.int32)
+            t = (bt.to(dev), kb.to(dev), kb.numpy(), lp_cpu)
+            self.step_cache["msa_tables"] = t
+        return t
+
+    def attend(self, q, qpos, qreq, reqs, limits, scale, attn,
+               qpos_cpu=None, qreq_cpu=None, key=None):
+        """Attention of rows (q, qpos, qreq) over the local keys of `reqs`
+        below `limits`, after this step's writes. In place with MSA's paged
+        mode (one plan per `key` per step, reused by every layer), else
+        gather + `attn`. In-place reads need every local slot below a row's
+        position to be valid: true under front-first hole order, with the
+        step's keys written before attention (Ulysses, pass-Q)."""
+        if not (self.in_place and q.is_cuda):
+            return attn(q, qpos, qreq, self.gather(reqs, limits), scale)
+        import numpy as np
+
+        from vllm.v1.attention.ops.msa import msa_attention, plan_msa_rows
+        bt, kb, kb_cpu, lp_cpu = self._msa_tables()
+        plan = self.step_cache.get(("msa_plan", key)) if key else None
+        if plan is None:
+            kv_lens = np.zeros(len(lp_cpu), dtype=np.int64)
+            for r, lim in zip(reqs, limits):
+                lp = lp_cpu[r]
+                kv_lens[r] = int(((lp >= 0) & (lp < lim)).sum())
+            qp = (qpos_cpu if qpos_cpu is not None else qpos.cpu()).numpy()
+            qr = (qreq_cpu if qreq_cpu is not None else qreq.cpu()).numpy()
+            hkv = self.kv_cache.shape[3]
+            plan = plan_msa_rows(qp, qr, kv_lens, hkv, q.shape[1] // hkv,
+                                 block_size=self.block_size, kblk_pos=kb_cpu,
+                                 device=q.device,
+                                 qpos_dev=qpos.to(torch.int32),
+                                 elem_size=q.element_size())
+            if key:
+                self.step_cache[("msa_plan", key)] = plan
+        rows, hq, d = q.shape
+        o = torch.zeros(rows, hq, d, dtype=torch.float32, device=q.device)
+        lse = torch.full((rows, hq), float("-inf"), dtype=torch.float32,
+                         device=q.device)
+        if rows:
+            msa_attention(q, self.kv_cache[0], self.kv_cache[1], bt, plan,
+                          kblk_pos=kb, softmax_scale=scale, out=o, lse=lse)
+        return o, lse
 
     def _slots(self, r: int, pos: torch.Tensor) -> torch.Tensor:
         lp = self.local_pos[r]

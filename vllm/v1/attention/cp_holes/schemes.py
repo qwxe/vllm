@@ -77,6 +77,15 @@ class _Scheme:
         # own_rows of every rank (derived from the plan, identical everywhere)
         self.rows_by_rank: list[torch.Tensor] = []
 
+    def _attend_store(self, store, q, qpos, qreq, reqs, lim, scale,
+                      qpos_cpu, qreq_cpu, key):
+        """Attention over the local store after this step's writes: in place
+        when the store supports it (PagedKVStore + MSA), else gather."""
+        if hasattr(store, "attend"):
+            return store.attend(q, qpos, qreq, reqs, lim, scale, self.attn,
+                                qpos_cpu, qreq_cpu, (self.name, id(self), key))
+        return self.attn(q, qpos, qreq, store.gather(reqs, lim), scale)
+
     def _to(self, t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         """Device copy of a plan-derived index tensor, made once per step.
 
@@ -174,11 +183,11 @@ class UlyssesCP(_Scheme):
             if kb + 1 < self.n_mb:
                 nxt = start1(kb + 1)
             qa, ka, va = unpack_rows(torch.cat(bufs), spec1)
-            qpos, qreq, reqs, lim = self.mb_meta[kb]
-            qpos, qreq = self._to(qpos, q), self._to(qreq, q)
+            qpos_c, qreq_c, reqs, lim = self.mb_meta[kb]
+            qpos, qreq = self._to(qpos_c, q), self._to(qreq_c, q)
             store.write(KeySet(ka, va, qpos, qreq))
-            keys = store.gather(reqs, lim)
-            o, _ = self.attn(qa, qpos, qreq, keys, scale)
+            o, _ = self._attend_store(store, qa, qpos, qreq, reqs, lim, scale,
+                                      qpos_c, qreq_c, kb)
             o = o.to(dt)
             send, off = [], 0
             for x in range(d):
@@ -286,8 +295,9 @@ class PassQCP(_Scheme):
             store.write(KeySet(ka, va, self._to(meta["kv_pos"], q),
                                self._to(meta["kv_req"], q)))
             qpos, qreq = self._to(meta["qpos"], q), self._to(meta["qreq"], q)
-            keys = store.gather(meta["reqs"], meta["lim"])
-            o, lse = self.attn(qa, qpos, qreq, keys, scale)
+            o, lse = self._attend_store(store, qa, qpos, qreq, meta["reqs"],
+                                        meta["lim"], scale, meta["qpos"],
+                                        meta["qreq"], kb)
             o = o.to(dt)
             send, off = [], 0
             for x in range(d):

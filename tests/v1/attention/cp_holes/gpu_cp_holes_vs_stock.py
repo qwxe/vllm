@@ -24,6 +24,11 @@ def main():
     ap.add_argument("--gpu-util", type=float, default=0.6)
     ap.add_argument("--out", required=True)
     ap.add_argument("--compare", default=None)
+    ap.add_argument("--tol", type=float, default=0.02,
+                    help="max |dlogprob| of the first token (fp32: 0.02; "
+                    "bf16: compare with the stock FA-vs-Triton noise)")
+    ap.add_argument("--allow-token-diff", action="store_true",
+                    help="bf16: greedy near-ties may flip on any path")
     a = ap.parse_args()
     backend = a.backend
     if a.cp_scheme:
@@ -58,7 +63,7 @@ def main():
             common = set(x["lp0"]) & {int(k) for k in y["lp0"]}
             dlp = max(abs(x["lp0"][k] - y["lp0"][str(k)]) for k in common)
             print(f"prompt {i}: tokens_equal={same} max|dlogprob0|={dlp:.4f}")
-            ok &= same and dlp < 0.02
+            ok &= (same or a.allow_token_diff) and dlp < a.tol
         print("RESULT", "PASS" if ok else "FAIL")
 
 
