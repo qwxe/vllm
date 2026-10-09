@@ -103,6 +103,7 @@ class MsaAttentionMetadataBuilder(AttentionMetadataBuilder[MsaAttentionMetadata]
         self.eps = float(os.environ.get("MSA_EPS", "0.05"))
         self.c = float(os.environ.get("MSA_C", "2.0"))
         self.num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        self.elem_size = torch.empty((), dtype=mc.dtype).element_size()
 
     def build(
         self,
@@ -124,6 +125,7 @@ class MsaAttentionMetadataBuilder(AttentionMetadataBuilder[MsaAttentionMetadata]
             eps=self.eps,
             c=self.c,
             num_rows=cm.num_actual_tokens,
+            elem_size=self.elem_size,
         )
         return MsaAttentionMetadata(
             num_actual_tokens=cm.num_actual_tokens,
@@ -186,7 +188,11 @@ class MsaAttentionImpl(TritonAttentionImpl):
 
 
 class MsaAttentionBackend(TritonAttentionBackend):
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
