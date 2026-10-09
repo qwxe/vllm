@@ -5,11 +5,11 @@ per-request ring / pass-Q choice, for prefill steps whose computed tokens are ar
 tail). The communication and partition layer is complete and tested over gloo. The local attention is a
 pure-PyTorch reference behind an interface that the hole-aware kernel (branch `holes/kernel`) plugs into.
 
-**Where the code is.** `/home/asd/vllm-dev` did not exist while this was built (the clone was waiting on a
-permission). The commits are in a staging repo whose paths mirror the vLLM tree:
-`/home/asd/LLMServingSim/.wt/cp-staging` (branch `holes/cp`). To move them onto the fork:
-`git -C <staging> format-patch --root -o /tmp/cp-patches`, then `git am /tmp/cp-patches/*` in the `holes/cp`
-worktree. The patches only add new files, so they apply to any 0.19 base.
+**Where the code is.** Branch `holes/cp`, worktree `/home/asd/vllm-dev-wt/cp` (on `holes/base` = v0.19.0).
+- The first 10 commits were written in a staging repo (`/home/asd/LLMServingSim/.wt/cp-staging`) while the fork
+  was being set up, and moved here with `format-patch` + `git am`. They add new files only.
+- `holes/core` is **merged** into `holes/cp` (merge commit "Merge holes/core ..."): the backend reads its
+  `CommonAttentionMetadata.hole_segments`.
 
 | file | what |
 |---|---|
@@ -20,7 +20,7 @@ worktree. The patches only add new files, so they apply to any 0.19 base.
 | `vllm/v1/attention/cp_holes/schemes.py` | `UlyssesCP`, `PassQCP`, `RingCP`, `AllGatherKVCP`, `AdaptiveCP`, `make_scheme` |
 | `vllm/v1/attention/backends/cp_holes.py` | `CPHolesBackend` / builder / impl, `register()` (as `AttentionBackendEnum.CUSTOM`) |
 | `tests/v1/attention/cp_holes/test_cp_gloo.py` | scheme math vs single-device attention, gloo, world 1/2/4/8 |
-| `tests/v1/attention/cp_holes/test_backend_gloo.py` | the backend glue (builder + impl) on vLLM's paged layout, gloo, world 2/4 |
+| `tests/v1/attention/cp_holes/test_backend_gloo.py` | the backend glue (builder + impl) on vLLM's paged layout, with holes/core's `hole_segments` and without holes, gloo, world 2/4 |
 | `benchmarks/cp_holes/bench_cp_holes.py`, `run_server.sh` | NCCL correctness check and per-scheme step time (torchrun) |
 
 ## 1. Common design
@@ -129,8 +129,17 @@ worktree. The patches only add new files, so they apply to any 0.19 base.
   block size by pcp·dcp, and `v1/worker/block_table.py::_compute_slot_mapping_kernel` interleaves by
   `cp_kv_cache_interleave_size`. pass-Q / ring / adaptive use that unchanged (`vllm_local_layout` is its
   inverse).
-- **Hole ranges.** The builder reads `common_attn_metadata.cp_segments` (per request, a list of `(start, length)`)
-  when `holes/core` provides it. Otherwise it uses the stock single segment `[seq_len - q_len, seq_len)`.
+- **Hole ranges (holes/core).** When a step has holes, holes/core's model runner hands the backend
+  segment-level metadata: one entry per segment (`query_start_loc` / `seq_lens` per segment, the request's
+  block-table row repeated) plus `common_attn_metadata.hole_segments` (`HoleSegments`: `seg_req_idx`,
+  `seg_query_lens`, `seg_ends`, `req_hole_tokens`).
+  - `request_segments(cam)` groups the segments back into requests: per request `(seg_end - q, q)` pairs, the
+    block-table row of the request's first segment, and E = max segment end.
+  - holes/core lays tokens out per request as hole pieces in position order, then the tail. That is exactly
+    the `StepPlan` computed-list order, so plan row indices are the model's token indices and `own_rows`
+    indexes the model's token tensors directly.
+  - Without holes (`hole_segments is None`) every entry is a request with the stock segment
+    `[seq_len - q_len, seq_len)`.
   `PagedKVStore.present` marks hole slots that are allocated in place but not yet computed, so they are never
   read before they are written.
 - **Dense-layer modes** (`VLLM_CP_HOLES_DENSE`):
@@ -156,7 +165,9 @@ worktree. The patches only add new files, so they apply to any 0.19 base.
    placement switch (proposed: `ParallelConfig.cp_kv_placement = interleave | head | replicate`) that leaves the
    block size alone. Ulysses also needs the KV cache spec at Hkv/d heads (1 when d > Hkv).
 2. The `sharded` dense mode's runner patch (above).
-3. `cp_segments` on `CommonAttentionMetadata`, from `holes/core`'s per-request computed ranges.
+3. (Done via the holes/core merge: `hole_segments`.) Still open: CP + holes in the scheduler. holes/core's
+   chunk planner (5.2 cuts) does not know the per-scheme budgets of KERNEL-ALGO 5.3 (2048·d, ring
+   max(2048, C_ring) per rank).
 4. CUDA graphs: the backend is eager-only (`_cudagraph_support = NEVER`, host-side plan per step). This is fine
    for prefill-only P/D instances.
 5. fp8 KV is refused (`kv_cache_dtype == "auto"` only).
@@ -167,15 +178,18 @@ worktree. The patches only add new files, so they apply to any 0.19 base.
 |---|---|---|
 | `test_cp_gloo.py --world 1 2 4 8` (gloo, CPU, `.wt/vllm-venv` python) | every scheme vs single-device attention over the full context. 7 random holed requests per step (several holes, sub-tile pieces, tail-only, fresh, hole-only steps, keys past E_step); Hq 8, Hkv 2/4/8 (Ulysses d > Hkv at d = 4, 8: Hkv 2, 4); fp32 (tol 2e-5) and bf16 (tol 3e-2); u = 16 and u = 128; 1 and 2 micro-batches; adaptive with both sub-schemes active; cache writes (each rank holds exactly what its placement homes, values bit-exact); all rows covered once | 160 / 160 OK (8 configs x 5 schemes x 4 world sizes); fp32 max error 8.3e-7, bf16 1.05e-2 |
 | same, `store="paged"` case | the schemes over `PagedKVStore` with vLLM's PCP slot layout and random block ids; store slots equal to vLLM's slot-mapping formula | OK at world 1/2/4/8 |
-| `test_backend_gloo.py --world 2 4` | `CPHolesMetadataBuilder.build` + `CPHolesImpl.forward` (replicated dense) on a paged cache filled at vLLM's slots, vs reference; cache writes at vLLM's slots | 10 / 10 OK, max error 4.8e-7 |
+| `test_backend_gloo.py --world 2 4` | `CPHolesMetadataBuilder.build` + `CPHolesImpl.forward` (replicated dense) on a paged cache filled at vLLM's slots, vs reference; cache writes at vLLM's slots | 20 / 20 OK (5 schemes x {hole_segments, stock} x world 2/4), max error 6.6e-7 |
 | `test_merge_and_c2e` | LSE merge over key chunks = unsplit; c2e covers every row once | OK |
-| GPU smoke, world 1 (RTX 4050, `gpurun`): `bench_cp_holes.py --check` | all schemes, 7 layouts, bf16, `TiledLocalAttention`, fused Triton merge | CHECK PASS (max error 3.5e-3) |
+| GPU smoke, world 1 (RTX 4050, `gpurun`): `bench_cp_holes.py --check` | all schemes, 7 layouts, bf16, `TiledLocalAttention`, fused Triton merge | CHECK PASS, 35 cases (max error 7.8e-3, bf16 O rounding on the fresh layout) |
 | fused vs PyTorch merge on GPU | `dcp_lse_combine_triton` path incl. -inf partials | fp32 1.7e-6, bf16 7.8e-3 (bf16 output rounding) |
 
-Commands (from the staging or worktree root):
-- `.wt/vllm-venv/bin/python tests/v1/attention/cp_holes/test_cp_gloo.py --world 2 4 8`
-- the same for `test_backend_gloo.py` (it needs vLLM importable);
-- `gpurun ... python benchmarks/cp_holes/bench_cp_holes.py --check`.
+Commands (all rerun from the worktree after the move and the holes/core merge):
+- `env PYTHONPATH=/home/asd/vllm-dev-wt/cp /home/asd/LLMServingSim/.wt/vllm-venv/bin/python
+  /home/asd/vllm-dev-wt/cp/tests/v1/attention/cp_holes/test_cp_gloo.py --world 1 2 4 8`
+- the same for `test_backend_gloo.py --world 2 4`;
+- `/home/asd/LLMServingSim/.wt/bin/gpurun env PYTHONPATH=/home/asd/vllm-dev-wt/cp
+  /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/cp/benchmarks/cp_holes/bench_cp_holes.py
+  --check` (allocates well under 1 GB; no vLLM engine, so `gpu_memory_utilization` does not apply).
 
 Pytest works as well (`pytest` is not in the venv).
 
@@ -209,7 +223,7 @@ Pytest works as well (`pytest` is not in the venv).
     are network buffers).
   - Ulysses at 1-2 KV heads per rank and pass-Q with short local key ranges need its split-KV (variant (c)).
   - `KERNEL-IMPL.md` was not present when this was written.
-- **`holes/core`.** Fill `cp_segments` from the scheduler's per-request ranges, and allocate hole blocks in
-  place so `PagedKVStore.present` can be derived from the block hit mask. The builder currently derives presence
-  from "position < E_step and not computed this step".
-  - `HOLES-CORE.md` was not present either.
+- **`holes/core`** (merged). Segments come from `hole_segments`. Open items:
+  - `PagedKVStore.present` is derived as "position < E_step and not computed this step". That matches holes/core,
+    which allocates hole blocks in place and schedules front first, but it is not read from its block hit mask.
+  - The end-to-end path (holes/core runner + CP_HOLES with pcp > 1) needs ≥ 2 GPUs (section 5, item 4).
