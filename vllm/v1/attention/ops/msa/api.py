@@ -118,7 +118,7 @@ def msa(q, k_cache, v_cache, block_table, segments, kv_lens, *, kblk_pos=None,
     G = q.shape[1] // Hkv
     if kblk_pos is not None and kblk_pos_cpu is None:
         kblk_pos_cpu = kblk_pos.cpu().numpy()
-    plan = plan_msa(segments, kv_lens, Hkv, G, block_size=k_cache.shape[1],
+    plan = plan_msa(segments, kv_lens, Hkv, G, block_size=k_cache.shape[1], elem_size=q.element_size(),
                     kblk_pos=kblk_pos_cpu, mode=mode, device=q.device,
                     num_rows=q.shape[0], **plan_kw)
     return msa_attention(q, k_cache, v_cache, block_table, plan, kblk_pos=kblk_pos,

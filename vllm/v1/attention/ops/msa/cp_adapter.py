@@ -69,7 +69,7 @@ class MsaLocalAttention:
         kpos_tab[kd_s, local] = kp_s
         key_pos = [kp_s[kstart[r]:kstart[r] + counts[r]] for r in range(R)]
         plan = plan_msa_rows(qp, qd, counts, hkv, hq // hkv, block_size=bs, key_pos=key_pos,
-                             mode=self.mode, device=dev,
+                             mode=self.mode, device=dev, elem_size=q.element_size(),
                              qpos_dev=torch.from_numpy(qp.astype(np.int32)).to(dev), **self.plan_kw)
         msa_attention(q, kbuf.view(total, bs, hkv, d), vbuf.view(total, bs, hkv, d),
                       torch.from_numpy(bt.astype(np.int32)).to(dev), plan,
@@ -93,7 +93,8 @@ def msa_paged_local(q, qpos, qreq, k_cache, v_cache, block_table, kblk_pos, kv_l
         kblk_pos_cpu = kblk_pos.cpu().numpy()
     plan = plan_msa_rows(qpos.cpu().numpy(), qreq.cpu().numpy(), np.asarray(kv_lens), hkv, hq // hkv,
                          block_size=k_cache.shape[1], kblk_pos=kblk_pos_cpu, mode=mode,
-                         device=q.device, qpos_dev=qpos.to(torch.int32), **plan_kw)
+                         device=q.device, qpos_dev=qpos.to(torch.int32), elem_size=q.element_size(),
+                         **plan_kw)
     msa_attention(q, k_cache, v_cache, block_table, plan, kblk_pos=kblk_pos, softmax_scale=scale,
                   out=out, lse=lse)
     return out, lse

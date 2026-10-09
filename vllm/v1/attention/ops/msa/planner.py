@@ -57,6 +57,19 @@ class MsaPlan:
         return self.bq * self.g_pad
 
 
+def _launch_config(m_rows, elem_size, bn, num_warps, num_stages):
+    """Tuned on the RTX 4050 (bench/tune.py): short tiles stream KV (BN 128, 3 stages), full
+    tiles are compute-bound (BN 64, 8 warps, 2 stages). fp32 inputs need smaller K/V tiles to
+    fit shared memory (~100 KB on SM 8.x)."""
+    if bn is None:
+        bn = (128 if m_rows <= 64 else 64) if elem_size <= 2 else 32
+    if num_warps is None:
+        num_warps = 4 if m_rows <= 64 else 8
+    if num_stages is None:
+        num_stages = (3 if m_rows <= 64 else 2) if elem_size <= 2 else 2
+    return bn, num_warps, num_stages
+
+
 class _KeyLayout:
     def __init__(self, kv_lens, kblk_pos, block_size, key_pos=None):
         self.kv_lens = np.asarray(kv_lens, dtype=np.int64)
@@ -103,6 +116,7 @@ def plan_msa(
     min_split: int | None = None,
     qpos: torch.Tensor | None = None,
     num_rows: int | None = None,
+    elem_size: int = 2,
 ) -> MsaPlan:
     """Build the work list. `rows_per_tile` is M = BQ * g_pad (rows of (token, head))."""
     seg = np.asarray(segments, dtype=np.int64).reshape(-1, 4)
@@ -118,12 +132,7 @@ def plan_msa(
     bq_cap = max(1, rows_per_tile // g_pad)
     bq = min(bq_cap, max(max(1, 32 // g_pad), _next_pow2(max_seg)))
     m_rows = bq * g_pad
-    if bn is None:
-        bn = 128 if m_rows <= 64 else 64
-    if num_warps is None:
-        num_warps = 4 if m_rows <= 64 else 8
-    if num_stages is None:
-        num_stages = 3 if m_rows <= 64 else 2
+    bn, num_warps, num_stages = _launch_config(m_rows, elem_size, bn, num_warps, num_stages)
     if min_split is None:
         min_split = 4 * bn
     lay = _KeyLayout(kv_lens, kblk_pos, block_size)
@@ -317,6 +326,7 @@ def plan_msa_rows(
     c: float = 2.0,
     min_split: int | None = None,
     qpos_dev: torch.Tensor | None = None,
+    elem_size: int = 2,
 ) -> MsaPlan:
     """Plan from per-row positions instead of segments (CP / ring-step callers).
 
@@ -345,12 +355,7 @@ def plan_msa_rows(
     bq_cap = max(1, rows_per_tile // g_pad)
     bq = min(bq_cap, max(max(1, 32 // g_pad), _next_pow2(max_run)))
     m_rows = bq * g_pad
-    if bn is None:
-        bn = 128 if m_rows <= 64 else 64
-    if num_warps is None:
-        num_warps = 4 if m_rows <= 64 else 8
-    if num_stages is None:
-        num_stages = 3 if m_rows <= 64 else 2
+    bn, num_warps, num_stages = _launch_config(m_rows, elem_size, bn, num_warps, num_stages)
     if min_split is None:
         min_split = 4 * bn
     lay = _KeyLayout(kv_lens, kblk_pos, block_size, key_pos=key_pos)
