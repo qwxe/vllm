@@ -2,7 +2,8 @@
 """gloo test of the CP_HOLES backend glue (metadata builder + impl).
 
 Drives `CPHolesMetadataBuilder.build` and `CPHolesImpl.forward` in the
-replicated-dense mode (the stock model runner feeds every CP rank all tokens)
+replicated-dense mode (the model runner feeds every CP rank all tokens), with
+holes/core's segment-level metadata (`hole_segments`) and without holes,
 on a paged KV cache laid out exactly as vLLM's PCP slot mapping lays it out,
 and checks every rank's full output against single-device attention, plus the
 cache writes. Needs vLLM installed (imports vllm.v1.attention.backend).
@@ -51,7 +52,7 @@ def _import_backend():
     return be
 
 
-def _worker(rank, world, port, scheme_name, q):
+def _worker(rank, world, port, scheme_name, q, holes=True):
     try:
         torch.set_num_threads(1)
         os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -65,6 +66,9 @@ def _worker(rank, world, port, scheme_name, q):
         cph = T.cph
         hq, hkv, dh, u = 8, 4, 16, 16
         plan0, efull = T.build_case(4242 + world, world, u, 6)
+        if not holes:  # stock steps: one segment per request, no holes
+            plan0 = cph.StepPlan([[(e // 3, e - e // 3)] for e in
+                                  plan0.e_step], d=world, u=u)
         segs = plan0.segments
         n = plan0.num_reqs
         e_step = plan0.e_step
@@ -102,13 +106,37 @@ def _worker(rank, world, port, scheme_name, q):
             flat[0, sm[sel]] = K[0][i][pos[sel]][:, ks]
             flat[1, sm[sel]] = V[0][i][pos[sel]][:, ks]
 
-        # stock per-token inputs: request-major, segments in position order
-        qlens = [sum(ln for _, ln in s) for s in segs]
-        qsl = torch.tensor([0] + list(torch.tensor(qlens).cumsum(0)))
-        cam = SimpleNamespace(
-            num_reqs=n, num_actual_tokens=plan0.m,
-            seq_lens_cpu=torch.tensor(e_step), query_start_loc_cpu=qsl,
-            block_table_tensor=bt, cp_segments=segs)
+        # inputs as holes/core's model runner lays them out: per request,
+        # hole pieces in position order, then the tail
+        if holes:
+            # segment-level metadata (segment_common_attn_metadata)
+            from vllm.v1.worker.hole_segments import HoleSegments
+            import numpy as np
+            sreq, sq, se = [], [], []
+            for i, ss in enumerate(segs):
+                for st, ln in ss:
+                    sreq.append(i)
+                    sq.append(ln)
+                    se.append(st + ln)
+            hs = HoleSegments(
+                seg_req_idx=np.asarray(sreq, dtype=np.int32),
+                seg_query_lens=np.asarray(sq, dtype=np.int32),
+                seg_ends=np.asarray(se, dtype=np.int32),
+                req_hole_tokens=np.asarray(
+                    [sum(ln for _, ln in ss[:-1]) for ss in segs],
+                    dtype=np.int32))
+            cam = SimpleNamespace(
+                num_reqs=hs.num_segments, num_actual_tokens=plan0.m,
+                seq_lens_cpu=torch.tensor(se),
+                query_start_loc_cpu=torch.from_numpy(hs.cu_query_lens()),
+                block_table_tensor=bt[torch.tensor(sreq)], hole_segments=hs)
+        else:
+            qlens = [sum(ln for _, ln in s) for s in segs]
+            qsl = torch.tensor([0] + list(torch.tensor(qlens).cumsum(0)))
+            cam = SimpleNamespace(
+                num_reqs=n, num_actual_tokens=plan0.m,
+                seq_lens_cpu=torch.tensor(e_step), query_start_loc_cpu=qsl,
+                block_table_tensor=bt, hole_segments=None)
         mc = SimpleNamespace(get_num_attention_heads=lambda pc: hq,
                              get_num_kv_heads=lambda pc: hkv,
                              get_head_size=lambda: dh)
@@ -141,12 +169,12 @@ def _worker(rank, world, port, scheme_name, q):
         q.put((rank, None, traceback.format_exc()))
 
 
-def run(world, scheme_name):
+def run(world, scheme_name, holes=True):
     import test_cp_gloo as T
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = T._free_port()
-    ps = [ctx.Process(target=_worker, args=(r, world, port, scheme_name, q))
+    ps = [ctx.Process(target=_worker, args=(r, world, port, scheme_name, q, holes))
           for r in range(world)]
     for p in ps:
         p.start()
@@ -163,6 +191,7 @@ def test_backend_glue():
     for w in (2, 4):
         for s in ("ulysses", "passq", "ring", "allgather", "adaptive"):
             assert run(w, s) < 2e-5
+            assert run(w, s, holes=False) < 2e-5
 
 
 if __name__ == "__main__":
@@ -173,6 +202,8 @@ if __name__ == "__main__":
     a = ap.parse_args()
     for w in a.world:
         for s in a.schemes:
-            e = run(w, s)
-            print(f"{'OK ' if e < 2e-5 else 'BAD'} backend world={w} {s:9s} "
-                  f"max_err={e:.2e}", flush=True)
+            for holes in (True, False):
+                e = run(w, s, holes)
+                print(f"{'OK ' if e < 2e-5 else 'BAD'} backend world={w} "
+                      f"{s:9s} {'hole_segments' if holes else 'stock':13s} "
+                      f"max_err={e:.2e}", flush=True)

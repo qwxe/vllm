@@ -36,10 +36,10 @@ KV placement:
   needs the KV cache spec built with Hkv / d heads (Hkv replicated over d / Hkv
   ranks when d > Hkv). Both are small core patches, listed in CP-IMPL.md.
 
-Hole ranges: the hole-aware scheduler (branch holes/core) is expected to put
-each request's computed ranges on the common metadata as `cp_segments`
-(list of [(start, length)] per request). Without it, every request has the
-single stock segment [seq_len - query_len, seq_len).
+Hole ranges come from holes/core: `common_attn_metadata.hole_segments`
+(`vllm.v1.worker.hole_segments.HoleSegments`), see `request_segments`. A step
+without holes uses the stock single segment [seq_len - query_len, seq_len)
+per request.
 """
 
 from __future__ import annotations
@@ -141,14 +141,8 @@ class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
     def build(self, common_prefix_len: int,
               common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> CPHolesMetadata:
-        cam = common_attn_metadata
-        n = cam.num_reqs
-        seq_lens = cam.seq_lens_cpu[:n].tolist()
-        qsl = cam.query_start_loc_cpu[:n + 1].tolist()
-        segs = getattr(cam, "cp_segments", None)
-        if segs is None:
-            segs = [[(seq_lens[i] - (qsl[i + 1] - qsl[i]),
-                      qsl[i + 1] - qsl[i])] for i in range(n)]
+        segs, bt_rows, seq_lens = request_segments(common_attn_metadata)
+        n = len(segs)
         d = self.comm.world
         sharded = self.scheme_name in _POSITION_SHARDED
         plan = StepPlan([list(s) for s in segs], d=d,
@@ -160,7 +154,7 @@ class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
             kw["n_mb"] = self.n_mb
         scheme = make_scheme(self.scheme_name, plan, self.comm, self.hq,
                              self.hkv, self.dh, **kw)
-        bt_cpu = cam.block_table_tensor[:n].cpu()
+        bt_cpu = bt_rows.cpu()
         w, r = (d, self.comm.rank) if sharded else (1, 0)
         tables, lpos, present = [], [], []
         for i in range(n):
@@ -179,10 +173,52 @@ class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
             tables.append(bt.to(dev))
             lpos.append(torch.where(ok, lp, torch.full_like(lp, -1)).to(dev))
             present.append(pr.to(dev))
-        return CPHolesMetadata(num_actual_tokens=cam.num_actual_tokens,
+        return CPHolesMetadata(
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
                                plan=plan, scheme=scheme, block_tables=tables,
                                local_pos=lpos, present=present,
                                dense=self.dense)
+
+
+def request_segments(cam):
+    """Per-request computed segments of the step, request block-table rows and
+    request sequence ends.
+
+    With holes/core, `cam.hole_segments` (a `HoleSegments`) is set when the
+    step has holes, and the metadata entries are segments (query_start_loc /
+    seq_lens per segment, the request's block-table row repeated). Segments
+    are in token order: per request, hole pieces in position order, then the
+    tail; this is the StepPlan's computed-list order, so the plan's row
+    indices are the model's token indices. Without holes every entry is one
+    request with the single segment [seq_len - q_len, seq_len).
+
+    Returns (segments [[(start, length)]], block-table rows [n, max_blocks],
+    seq_ends [n]).
+    """
+    hs = getattr(cam, "hole_segments", None)
+    if hs is None:
+        n = cam.num_reqs
+        seq = cam.seq_lens_cpu[:n].tolist()
+        qsl = cam.query_start_loc_cpu[:n + 1].tolist()
+        segs = [[(seq[i] - (qsl[i + 1] - qsl[i]), qsl[i + 1] - qsl[i])]
+                for i in range(n)]
+        return segs, cam.block_table_tensor[:n], seq
+    req = hs.seg_req_idx.tolist()
+    q = hs.seg_query_lens.tolist()
+    ends = hs.seg_ends.tolist()
+    segs, first, seq = [], [], []
+    for k, r in enumerate(req):
+        if not first or req[first[-1]] != r:
+            assert not first or r > req[first[-1]], \
+                "hole segments must be grouped by request"
+            first.append(k)
+            segs.append([])
+            seq.append(0)
+        segs[-1].append((ends[k] - q[k], q[k]))
+        seq[-1] = max(seq[-1], ends[k])
+    rows = torch.tensor(first, dtype=torch.int64,
+                        device=cam.block_table_tensor.device)
+    return segs, cam.block_table_tensor.index_select(0, rows), seq
 
 
 class CPHolesImpl(AttentionImpl[CPHolesMetadata]):
