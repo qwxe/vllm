@@ -2,14 +2,20 @@
 
 Implements KERNEL-ALGO.md section 4 (and 8.2 steps 4-5): Ulysses, pass-Q, ring pass-KV, all-gather KV, and the
 per-request ring / pass-Q choice, for prefill steps whose computed tokens are arbitrary segments (hole pieces +
-tail). The communication and partition layer is complete and tested over gloo. The local attention is a
-pure-PyTorch reference behind an interface that the hole-aware kernel (branch `holes/kernel`) plugs into.
+tail). The communication and partition layer is tested over gloo at d = 1/2/4/8. The local attention is the
+hole-aware MSA kernel from `holes/kernel` on CUDA (in place on the paged cache for Ulysses / pass-Q), with
+PyTorch implementations for CPU tests. The backend runs inside real vLLM (one GPU, CP world size 1) on holed
+prefills from `holes/core`.
 
 **Where the code is.** Branch `holes/cp`, worktree `/home/asd/vllm-dev-wt/cp` (on `holes/base` = v0.19.0).
 - The first 10 commits were written in a staging repo (`/home/asd/LLMServingSim/.wt/cp-staging`) while the fork
   was being set up, and moved here with `format-patch` + `git am`. They add new files only.
 - `holes/core` is **merged** into `holes/cp` (merge commit "Merge holes/core ..."): the backend reads its
   `CommonAttentionMetadata.hole_segments`.
+- `holes/kernel` is **merged** (merge commit "Merge holes/kernel ..."): MSA is the CP local attention.
+- The branch also patches vLLM core in a few places (section 3.1): the `--cp-kv-placement` switch, the
+  sharded-dense model-runner path, the CP step budgets in holes/core's planner, and the missing-KV ranges from
+  the scheduler.
 
 | file | what |
 |---|---|
@@ -20,8 +26,12 @@ pure-PyTorch reference behind an interface that the hole-aware kernel (branch `h
 | `vllm/v1/attention/cp_holes/schemes.py` | `UlyssesCP`, `PassQCP`, `RingCP`, `AllGatherKVCP`, `AdaptiveCP`, `make_scheme` |
 | `vllm/v1/attention/backends/cp_holes.py` | `CPHolesBackend` / builder / impl, `register()` (as `AttentionBackendEnum.CUSTOM`) |
 | `tests/v1/attention/cp_holes/test_cp_gloo.py` | scheme math vs single-device attention, gloo, world 1/2/4/8 |
-| `tests/v1/attention/cp_holes/test_backend_gloo.py` | the backend glue (builder + impl) on vLLM's paged layout, with holes/core's `hole_segments` and without holes, gloo, world 2/4 |
-| `benchmarks/cp_holes/bench_cp_holes.py`, `run_server.sh` | NCCL correctness check and per-scheme step time (torchrun) |
+| `tests/v1/attention/cp_holes/test_backend_gloo.py` | the backend glue (builder + impl) on vLLM's paged layout, with holes/core's `hole_segments` and without holes, replicated and sharded dense, gloo, world 2/4 |
+| `tests/v1/attention/cp_holes/test_kv_placement.py` | `--cp-kv-placement`: capacity, KV spec heads, vLLM's slot-mapping kernel under a faked PCP group (GPU part) |
+| `tests/v1/attention/cp_holes/test_msa_paged_gpu.py` | MSA as the local attention, gathered and paged in place, vs the reference (GPU) |
+| `tests/v1/attention/cp_holes/gpu_cp_holes_e2e.py`, `gpu_cp_holes_vs_stock.py` | real vLLM with CP_HOLES on one GPU: holes/core's holed e2e check; greedy output vs a stock backend |
+| `tests/v1/holes/test_holes_cp_budget.py`, `test_holes_missing_kv.py` | CP step budgets in the planner; missing-KV ranges scheduler -> runner -> slot validity |
+| `benchmarks/cp_holes/bench_cp_holes.py`, `run_server.sh` | NCCL correctness check and per-scheme step time (torchrun); `--local-attn msa --store paged` = the backend's path |
 
 ## 1. Common design
 
@@ -37,8 +47,16 @@ pure-PyTorch reference behind an interface that the hole-aware kernel (branch `h
   update, so the backend sets `forward_includes_kv_cache_update = True`.
 - **Local primitive.** `attend(Q, qpos, qreq, KeySet(k, v, kpos, kreq)) -> (O fp32, LSE fp32)`, with mask
   `qreq == kreq and kpos <= qpos` (KERNEL-ALGO 2.1). A row with no key gives O = 0, LSE = -inf. The pass-Q
-  per-row limit and the ring's buffer positions are this mask, so no scheme needs a special kernel. Switch point:
-  `set_local_attention(fn)`, or the `local_attn=` argument.
+  per-row limit and the ring's buffer positions are this mask, so no scheme needs a special kernel.
+  - Selection (`CP_HOLES_LOCAL_ATTN`): `auto` (default: MSA `MsaLocalAttention` for CUDA tensors, the tiled
+    PyTorch version on CPU), `msa`, `tiled`, `ref`, or `module:attr`. `set_local_attention(fn)` or the
+    `local_attn=` argument override it.
+  - **In place.** Ulysses and pass-Q attend after the step's keys are written, so they call
+    `store.attend(...)`. `PagedKVStore.attend` runs MSA's paged mode on the vLLM cache with per-block start
+    positions (`kblk_pos`, strided under interleaving). It plans once per step and micro-batch
+    (`plan_msa_rows`), and every layer reuses that plan (`CPHolesMetadata.step_cache`).
+  - Ring buffers (network buffers) and all-gather's cached-key pass (run before the new keys are written) use
+    the gathered `KeySet` path through `MsaLocalAttention`.
 - **Wire.** Q / K / V / O travel in the model dtype (bf16), LSE in fp32 (decision 4.D). Each collective packs its
   tensors row-wise into one uint8 buffer, so one collective carries mixed dtypes. Gloo and NCCL move the same
   bytes.
@@ -125,10 +143,19 @@ pure-PyTorch reference behind an interface that the hole-aware kernel (branch `h
     every layer reuses them.
   - The impl wraps the layer's `kv_cache` in a `PagedKVStore` (layout `[2, num_blocks, block_size, Hkv, D]`,
     as FlashAttention's) and runs the scheme.
-- **KV placement.** PCP already provides the virtual block. `single_type_kv_cache_manager.py` multiplies the
-  block size by pcp·dcp, and `v1/worker/block_table.py::_compute_slot_mapping_kernel` interleaves by
-  `cp_kv_cache_interleave_size`. pass-Q / ring / adaptive use that unchanged (`vllm_local_layout` is its
-  inverse).
+- **KV placement: `--cp-kv-placement interleave | head | replicate`** (new `ParallelConfig.cp_kv_placement`,
+  part of the config hash).
+  - `interleave` (default) is vLLM's PCP layout: `single_type_kv_cache_manager.py` multiplies the block size by
+    pcp·dcp, and `_compute_slot_mapping_kernel` interleaves by `cp_kv_cache_interleave_size`. pass-Q / ring /
+    adaptive use it unchanged (`vllm_local_layout` is its inverse).
+  - `head` (Ulysses) and `replicate` (all-gather KV) put every position on every PCP rank.
+    `ParallelConfig.kv_interleave_pcp_size` is then 1: the scheduler's KV manager (`pcp_world_size`), the
+    capacity (`max_memory_usage_bytes`, `kv_cache_utils`, `max_num_kv_tokens`), `BlockTable`'s slot mapping and
+    `get_total_cp_world_size` all see no interleave (worker side via `cp_utils.set_cp_kv_placement`, set by the
+    model runner).
+  - `head` also builds the KV cache spec with `cp_kv_heads_per_rank(Hkv, pcp)` heads (Hkv/pcp, or 1 when
+    pcp > Hkv) in `Attention.get_kv_cache_spec`.
+  - The builder asserts that the scheme matches the placement (`REQUIRED_PLACEMENT`).
 - **Hole ranges (holes/core).** When a step has holes, holes/core's model runner hands the backend
   segment-level metadata: one entry per segment (`query_start_loc` / `seq_lens` per segment, the request's
   block-table row repeated) plus `common_attn_metadata.hole_segments` (`HoleSegments`: `seg_req_idx`,
@@ -140,17 +167,29 @@ pure-PyTorch reference behind an interface that the hole-aware kernel (branch `h
     indexes the model's token tensors directly.
   - Without holes (`hole_segments is None`) every entry is a request with the stock segment
     `[seq_len - q_len, seq_len)`.
-  `PagedKVStore.present` marks hole slots that are allocated in place but not yet computed, so they are never
-  read before they are written.
+- **KV-slot validity from the hit mask.** At the end of `schedule()`, the scheduler reports per request the
+  ranges whose KV is still missing after the step (`SchedulerOutput.missing_kv_ranges`, i.e. the pending hole
+  ranges: the hit-mask misses not computed yet). The model runner carries them in
+  `HoleSegments.req_missing_ranges`. `kv_slot_validity` then marks a slot valid when its position is below the
+  request's end, not computed this step, and not missing. A missing range below E_step would be read by a query,
+  so it raises. Under front-first order every missing range lies past E_step.
 - **Dense-layer modes** (`VLLM_CP_HOLES_DENSE`):
-  - `replicated` (default) works with the **stock model runner**. Every PCP rank runs the dense layers on all
-    tokens; attention runs the scheme on `own_rows` and all-gathers O (`gather_rows`). Logits are identical on
-    all ranks, so sampling is unchanged. This is the end-to-end correctness mode: it costs d x dense compute and
-    an extra all-gather of O.
-  - `sharded` is the performance mode. The runner must feed each rank only `metadata.scheme.own_rows` (helper
-    `shard_inputs` for `input_ids` / `positions`) and gather the logits rows (`gather_rows`). That is a
-    `gpu_model_runner._prepare_inputs` patch, not written yet: it needs the attention metadata before the input
-    slice, so the builder's plan has to be built first.
+  - `replicated` (default): every PCP rank runs the dense layers on all tokens. Attention runs the scheme on
+    `own_rows` and all-gathers O (`gather_rows`). Logits are identical on all ranks. This is the correctness
+    reference; it costs d x dense compute and an extra all-gather of O.
+  - `sharded` (`gpu_model_runner.execute_model` patch):
+    - After `_preprocess`, `cp_holes_sharded_scheme(attn_metadata)` returns the step's scheme. The runner then
+      keeps only `own_rows` of `input_ids` / `positions` / `inputs_embeds` (`shard_inputs`) and runs the model
+      eagerly on them (`num_tokens = n_own`, no CUDA graph). The attention metadata still describes the whole
+      step.
+    - The hidden states of the logits rows (each request's tail-last token) come from whichever rank owns
+      them: `gather_logits_hidden`, one all-reduce of num_logits x hidden over the CP group, zeros elsewhere.
+    - Every rank then computes logits and samples exactly as without CP. That keeps the per-rank request state
+      identical (as under TP), and PCP rank 0 returns the output.
+    - This deliberately deviates from "logits only on the owner": owner-only logits plus a broadcast of the
+      sampled tokens would also need logprobs and sampler state broadcast, for no saving beyond one
+      lm_head on num_reqs rows.
+    - Spec decode, pooling and PP are refused in this mode.
 - **Merge.** On CUDA it uses `vllm.v1.attention.ops.dcp_alltoall.dcp_lse_combine_triton` (handles -inf
   partials; head_dim a power of 2), otherwise PyTorch. `cp_lse_ag_out_rs` is at `v1/attention/ops/common.py`
   (not `vllm/attention/ops`, as the doc assumed). `merge_attn_states` is at
@@ -159,71 +198,106 @@ pure-PyTorch reference behind an interface that the hole-aware kernel (branch `h
   (all-to-all around attention, TP-like head-sliced KV, KV-head replication for SP > KV heads), reimplemented in
   `UlyssesCP`.
 
-### Core patches still needed (outside this branch's files)
-1. **Ulysses and AG-R KV accounting.** With pcp > 1 the KV manager multiplies the block size by pcp, which is
-   right only for position sharding. Ulysses (head slices of every position) and AG-R (replicated) need a
-   placement switch (proposed: `ParallelConfig.cp_kv_placement = interleave | head | replicate`) that leaves the
-   block size alone. Ulysses also needs the KV cache spec at Hkv/d heads (1 when d > Hkv).
-2. The `sharded` dense mode's runner patch (above).
-3. (Done via the holes/core merge: `hole_segments`.) Still open: CP + holes in the scheduler. holes/core's
-   chunk planner (5.2 cuts) does not know the per-scheme budgets of KERNEL-ALGO 5.3 (2048·d, ring
-   max(2048, C_ring) per rank).
-4. CUDA graphs: the backend is eager-only (`_cudagraph_support = NEVER`, host-side plan per step). This is fine
-   for prefill-only P/D instances.
-5. fp8 KV is refused (`kv_cache_dtype == "auto"` only).
+### 3.1 Core patches on this branch (beyond the backend files)
+1. `--cp-kv-placement` (above): `config/parallel.py`, `engine/arg_utils.py`, `v1/kv_cache_interface.py`,
+   `v1/core/kv_cache_utils.py`, `v1/core/sched/scheduler.py`, `v1/worker/{cp_utils,block_table,gpu_model_runner}.py`,
+   `model_executor/layers/attention/attention.py`.
+2. Sharded dense mode: `v1/worker/gpu_model_runner.py` (execute_model).
+3. **CP step budgets in holes/core's planner** (KERNEL-ALGO 5.3). New holes config keys:
+   - `cp_scheme` (`ulysses|passq|allgather|ring|adaptive`), `cp_size` (0 = PCP size), `cp_rank_tokens` (2048),
+     `cp_attn_tflops` (280), `cp_link_gbps` (16), `cp_passq_ratio` (0.2), set via `additional_config["holes"]`
+     or `VLLM_HOLES`.
+   - `cp_step_budget`:
+     - Ulysses / pass-Q / all-gather: d·cp_rank_tokens;
+     - ring: d·max(cp_rank_tokens, C_ring), with C_ring = F_attn/(4·BW) rounded up to the 128 granule (4480 at
+       280 TFLOP/s and 16 GB/s);
+     - adaptive: the ring's budget when the request's remaining work / context ≥ ratio, else pass-Q's.
+   - The scheduler's `_plan_hole_step` caps a holed request's step with it. `step_budget`,
+     `long_prefill_token_threshold` and `max_num_batched_tokens` still apply, so set `max_num_batched_tokens`
+     ≥ the CP budget.
+   - The planner covers holed requests only. Non-holed prefills keep vLLM's stock chunking.
+4. Missing-KV ranges: `v1/core/sched/{output,scheduler}.py`, `v1/worker/hole_segments.py`, the runner.
 
-## 4. Tests run here (all pass)
+Still not supported: CUDA graphs (eager only; host-side plan per step, fine for prefill-only P/D instances), fp8
+KV.
+
+## 4. Tests run here (all pass; final rerun on the merged branch)
 
 | test | what it checks | result |
 |---|---|---|
-| `test_cp_gloo.py --world 1 2 4 8` (gloo, CPU, `.wt/vllm-venv` python) | every scheme vs single-device attention over the full context. 7 random holed requests per step (several holes, sub-tile pieces, tail-only, fresh, hole-only steps, keys past E_step); Hq 8, Hkv 2/4/8 (Ulysses d > Hkv at d = 4, 8: Hkv 2, 4); fp32 (tol 2e-5) and bf16 (tol 3e-2); u = 16 and u = 128; 1 and 2 micro-batches; adaptive with both sub-schemes active; cache writes (each rank holds exactly what its placement homes, values bit-exact); all rows covered once | 160 / 160 OK (8 configs x 5 schemes x 4 world sizes); fp32 max error 8.3e-7, bf16 1.05e-2 |
-| same, `store="paged"` case | the schemes over `PagedKVStore` with vLLM's PCP slot layout and random block ids; store slots equal to vLLM's slot-mapping formula | OK at world 1/2/4/8 |
-| `test_backend_gloo.py --world 2 4` | `CPHolesMetadataBuilder.build` + `CPHolesImpl.forward` (replicated dense) on a paged cache filled at vLLM's slots, vs reference; cache writes at vLLM's slots | 20 / 20 OK (5 schemes x {hole_segments, stock} x world 2/4), max error 6.6e-7 |
-| `test_merge_and_c2e` | LSE merge over key chunks = unsplit; c2e covers every row once | OK |
-| GPU smoke, world 1 (RTX 4050, `gpurun`): `bench_cp_holes.py --check` | all schemes, 7 layouts, bf16, `TiledLocalAttention`, fused Triton merge | CHECK PASS, 35 cases (max error 7.8e-3, bf16 O rounding on the fresh layout) |
-| fused vs PyTorch merge on GPU | `dcp_lse_combine_triton` path incl. -inf partials | fp32 1.7e-6, bf16 7.8e-3 (bf16 output rounding) |
+| `test_cp_gloo.py --world 1 2 4 8` (gloo, CPU) | every scheme vs single-device attention over the full context. 7 random holed requests per step (several holes, sub-tile pieces, tail-only, fresh, hole-only steps, keys past E_step); Hq 8, Hkv 2/4/8 (Ulysses d > Hkv); fp32 / bf16; u = 16 / 128; 1-2 micro-batches; adaptive with both sub-schemes; a vLLM-layout paged store; bit-exact cache writes; all rows covered once | 160 / 160 OK; fp32 max error 8.3e-7, bf16 1.05e-2 |
+| `test_backend_gloo.py --world 2 4` | builder + impl on a paged cache filled at vLLM's slots, vs reference: holes/core `hole_segments` and stock metadata (replicated dense), and the sharded mode (own rows only + the logits-row gather); cache writes at vLLM's slots | 30 / 30 OK, max error 6.6e-7 |
+| `test_kv_placement.py` (CPU + GPU) | `kv_interleave_pcp_size`, per-rank capacity, config hash, KV spec heads under `head`; vLLM's real slot-mapping Triton kernel under a faked PCP group (2 / 4 ranks, every rank): `interleave` = `vllm_slot_mapping`, `head` / `replicate` = the plain layout, all slots local | OK |
+| `tests/v1/holes/test_holes_cp_budget.py` | budget values (all schemes, fast link, adaptive); scheduler with a 4800-token hole: pass-Q / Ulysses d = 2 -> 4096 + 704 (+1-token tail), ring -> one step, capped by max_num_batched_tokens | OK |
+| `tests/v1/holes/test_holes_missing_kv.py` | scheduler reports [(2304, 5056)], [(4352, 5056)], none over a chunked hole; `build_hole_segments` carries them; slot validity; a missing range below E_step raises | OK |
+| holes/core's own CPU tests after the merges | `test_holes_plan` 13, `test_holes_kv` 10, `test_holes_segments` 3 | all PASS |
+| `test_msa_paged_gpu.py` (GPU) | `AutoLocalAttention` (MSA) vs reference on random holed key sets; `PagedKVStore.attend` in place (MSA paged, strided `kblk_pos` for rank 1 of 4 / rank 0 of 2, plain layout) vs gather + reference, with the plan reused | fp32 3.3e-3 (TF32 dots), bf16 2.9e-3 |
+| `bench_cp_holes.py --check` (GPU, world 1) | 7 layouts x 5 schemes, bf16; tiled / MSA gathered / MSA paged in place | CHECK PASS each (max error 7.8e-3) |
+| **real vLLM**, `gpu_cp_holes_vs_stock.py`, Qwen2.5-0.5B, fp32, eager | greedy 24 tokens + first-token top-5 logprobs vs TRITON_ATTN, 3 prompts (one ~2.4K tokens, chunked at 1024) | tiled local attention: ulysses / ring / allgather / adaptive sharded, passq replicated: tokens equal, dlp <= 0.019. MSA in place: passq / ulysses sharded: tokens equal, dlp <= 0.0052 |
+| same, bf16 | noise reference: FLASH_ATTN vs TRITON_ATTN dlp <= 0.079 | MSA in place, passq sharded: dlp <= 0.10, 1 of 3 greedy sequences flips (near-tie, bf16). The tiled stand-in in bf16 is worse (dlp <= 0.42; P@V in bf16), so it is for fp32 / CPU only |
+| **real vLLM**, `gpu_cp_holes_e2e.py` (holes/core's holed e2e: mid / front / two holes, a 4800-token hole chunked over 3 steps, 1-token tail, mixed batch) | holed run vs full recompute with CP_HOLES | fp32: passq / ulysses / adaptive sharded and ring replicated (tiled), passq sharded (MSA in place): 18/18 sequences equal, prefill computes exactly hole + tail, PASS. bf16 ulysses sharded (MSA): 17/18 equal, PASS by holes/core's noise rule |
 
-Commands (all rerun from the worktree after the move and the holes/core merge):
+The CP world size is 1 in the real-vLLM runs (one GPU). They exercise the backend inside vLLM: the builder on
+holes/core metadata, the paged store and cache writes, decodes, the sharded runner path (identity shard and
+gather) and MSA in place. They do not exercise collectives.
+
+**Bench on the RTX 4050** (world 1, E = 8192, m = 2048, 2 layers; per-layer ms; `attn` = local attention).
+Laptop numbers, relative only:
+
+| layout | scheme | tiled attn | MSA gathered attn | MSA paged in place attn | comm-only |
+|---|---|---|---|---|---|
+| tail | passq | 178.5 | 17.1 | 11.4 | 3.7 |
+| tail | ulysses | 178.5 | 16.7 | 11.4 | 3.4 |
+| tail | ring | 177.6 | 14.4 | 14.3 (gathered by design) | 3.5 |
+| tiny8 | passq | 160.7 | 15.3 | 10.1 | 3.6 |
+| deep_small | ulysses | 183.1 | 18.1 | 11.5 | 3.4 |
+
+The comm-only column (3.4-3.7 ms per layer at world 1, with no network) is per-layer Python, packing and
+merging overhead. It is the next thing to cut before the server runs, e.g. by precomputing the pack index
+tensors and avoiding the per-write `unique` / `nonzero` syncs in `PagedKVStore.write`.
+
+Commands (from anywhere; GPU jobs through gpurun):
 - `env PYTHONPATH=/home/asd/vllm-dev-wt/cp /home/asd/LLMServingSim/.wt/vllm-venv/bin/python
-  /home/asd/vllm-dev-wt/cp/tests/v1/attention/cp_holes/test_cp_gloo.py --world 1 2 4 8`
-- the same for `test_backend_gloo.py --world 2 4`;
-- `/home/asd/LLMServingSim/.wt/bin/gpurun env PYTHONPATH=/home/asd/vllm-dev-wt/cp
-  /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/cp/benchmarks/cp_holes/bench_cp_holes.py
-  --check` (allocates well under 1 GB; no vLLM engine, so `gpu_memory_utilization` does not apply).
-
-Pytest works as well (`pytest` is not in the venv).
+  /home/asd/vllm-dev-wt/cp/tests/v1/attention/cp_holes/test_cp_gloo.py --world 1 2 4 8` (the same for
+  `test_backend_gloo.py --world 2 4`).
+- `tests/v1/holes/*.py`: the same, with `PYTHONPATH=<wt>:<wt>/tests/v1/holes`.
+- `/home/asd/LLMServingSim/.wt/bin/gpurun env PYTHONPATH=/home/asd/vllm-dev-wt/cp <venv python> <script>` for
+  `test_kv_placement.py`, `test_msa_paged_gpu.py`, `bench_cp_holes.py --check [--local-attn msa --store paged]`,
+  `gpu_cp_holes_vs_stock.py` (`--backend TRITON_ATTN --out ref.json`, then `--cp-scheme S --cp-dense sharded
+  --out x.json --compare ref.json`) and `gpu_cp_holes_e2e.py --cp-scheme S --cp-dense sharded --eager --dtype
+  float32 --gpu-util 0.6`.
 
 ## 5. What needs the rented server
 
-1. **NCCL correctness at d = 2/4/8:**
-   - `torchrun --nproc-per-node d benchmarks/cp_holes/bench_cp_holes.py --check` (plus `--hkv 2` for U-R).
-   - `run_server.sh` does both, and records `nvidia-smi topo -m` / `-p2p`.
+1. **NCCL correctness at d = 2/4/8.** `run_server.sh` runs `bench_cp_holes.py --check` (tiled; `--hkv 2` for
+   replicated Ulysses heads; MSA paged in place) and records `nvidia-smi topo -m` / `-p2p`.
 2. **Per-scheme step time.** `run_server.sh` (layouts rate / tail / deep_small / tiny8 / hole_only / multi, E
-   32K / 128K, m 2K / 16K, d 1-8) writes JSONL. It reports `total`, `attn` (local attention alone), `comm` (the
-   same forward with a null attention: collectives + packing + merges + cache writes) and bytes sent per rank.
-   - The timings are only as good as the local attention. `TiledLocalAttention` is an unfused PyTorch stand-in.
-   - Pass `--local-attn module:Class` for the `holes/kernel` adapter once it exists.
-   - The reference stores gather resident KV into contiguous buffers (one HBM copy per layer). A paged in-place
-     kernel removes that copy (see 6).
+   32K / 128K, m 2K / 16K, d 1-8) runs MSA paged in place (the backend's path) and the tiled stand-in, and
+   writes JSONL with `total`, `attn`, `comm` (null attention) and bytes sent per rank.
 3. **Overlap check.**
-   - Run `nsys` on one Ulysses / pass-Q step (2 micro-batches) and one ring step. Confirm that NCCL kernels on
-     the NCCL stream overlap the attention on the compute stream.
+   - Run `nsys` on one Ulysses / pass-Q step (2 micro-batches) and one ring step: do the NCCL kernels overlap
+     MSA?
    - Measure the compute slowdown from NCCL's SMs (KERNEL-ALGO 7.4 item 4).
-4. **End-to-end vLLM, replicated-dense mode.**
-   - Run `--prefill-context-parallel-size d --block-size 128 --cp-kv-cache-interleave-size 128
-     --attention-backend CUSTOM` with `register()` called (e.g. from a plugin) and `VLLM_CP_HOLES_SCHEME=passq|ring|adaptive`.
-   - Compare logits with pcp = 1 on the same prompts. This also checks whether the 0.19 GPU runner otherwise
-     tolerates pcp > 1, which is unverified here (needs ≥ 2 GPUs).
+4. **End-to-end vLLM with pcp > 1.**
+   - Flags: `--prefill-context-parallel-size d --attention-backend CUSTOM`, with `register()` called in the
+     engine process (`VLLM_ENABLE_V1_MULTIPROCESSING=0` or a plugin) and `VLLM_CP_HOLES_SCHEME` set.
+   - Per scheme:
+     - pass-Q / ring / adaptive: `--cp-kv-placement interleave --block-size 128
+       --cp-kv-cache-interleave-size 128`;
+     - Ulysses: `--cp-kv-placement head`;
+     - all-gather: `--cp-kv-placement replicate`.
+   - Run replicated vs sharded dense, and compare logits with pcp = 1 (the scripts above take the same
+     arguments).
+   - Unverified here: the rest of the 0.19 GPU runner / executor with pcp > 1 (worker layout, output rank =
+     PCP rank 0).
 
-## 6. Integration with the sibling branches (pending)
+## 6. Integration with the sibling branches (merged)
 
-- **`holes/kernel`.** Wrap its O+LSE API as a `LocalAttention`: `(q, qpos, qreq, KeySet, scale) -> (O, LSE)`.
-  - For the paged path, extend the store protocol with a view that returns `(kv_cache, block_table, kblk_pos,
-    limits)` instead of a gathered `KeySet`. `PagedKVStore` already holds these. Ring buffers stay gathered (they
-    are network buffers).
-  - Ulysses at 1-2 KV heads per rank and pass-Q with short local key ranges need its split-KV (variant (c)).
-  - `KERNEL-IMPL.md` was not present when this was written.
-- **`holes/core`** (merged). Segments come from `hole_segments`. Open items:
-  - `PagedKVStore.present` is derived as "position < E_step and not computed this step". That matches holes/core,
-    which allocates hole blocks in place and schedules front first, but it is not read from its block hit mask.
-  - The end-to-end path (holes/core runner + CP_HOLES with pcp > 1) needs ≥ 2 GPUs (section 5, item 4).
+- **`holes/kernel`.** MSA through `MsaLocalAttention` (gathered: ring buffers, all-gather cached keys) and
+  `msa_attention` + `plan_msa_rows` on the paged cache (Ulysses, pass-Q; the plan is built once per step and
+  micro-batch and reused by every layer).
+  - MSA's split-KV covers Ulysses at 1-2 KV heads per rank and pass-Q's short local key ranges.
+  - MSA's paged invariant (every local slot below a row's position is valid) holds: the step's keys are written
+    before attention, and missing ranges lie past E_step (they are checked).
+- **`holes/core`.** Segments come from `hole_segments`, and slot validity from `missing_kv_ranges`. The CP
+  budgets live in its planner.
