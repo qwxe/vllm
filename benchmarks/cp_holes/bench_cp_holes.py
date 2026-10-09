@@ -20,7 +20,8 @@ max over ranks):
 - attn: the local attention calls alone (summed), with the real data;
 - bytes: bytes this rank sent per layer (from the plan).
 The local attention is pluggable (`--local-attn`): `tiled` (PyTorch, default),
-`ref`, or `module:attr` for the hole-aware kernel (branch holes/kernel).
+`ref`, `msa` (holes/kernel's MsaLocalAttention over gathered keys), or
+`module:attr`.
 """
 
 from __future__ import annotations
@@ -64,7 +65,8 @@ def layout(name: str, E: int, m: int) -> list[list[tuple[int, int]]]:
     """
     if name == "rate":
         h = min(15600, m // 2)
-        return [[(7500, h), (E - (m - h), m - h)]]
+        s0 = min(7500, E // 4)
+        return [[(s0, h), (E - (m - h), m - h)]]
     if name == "tail":
         return [[(E - m, m)]]
     if name == "fresh":
@@ -75,7 +77,7 @@ def layout(name: str, E: int, m: int) -> list[list[tuple[int, int]]]:
         p = [(E // 4 + 128 * i, 64) for i in range(8)]
         return [p + [(E - (m - 512), m - 512)]]
     if name == "hole_only":
-        return [[(7500, m)]]
+        return [[(min(7500, E // 4), m)]]
     if name == "multi":
         return [[(E // 4 - m // 4, m // 4)] for _ in range(4)]
     raise ValueError(name)
@@ -153,6 +155,9 @@ class TimedAttention:
 
 
 def get_local_attn(spec: str):
+    if spec == "msa":
+        from vllm.v1.attention.ops.msa import MsaLocalAttention
+        return MsaLocalAttention(mode="auto")
     if spec == "tiled":
         return cph.local_attn.TiledLocalAttention()
     if spec == "ref":
@@ -170,7 +175,8 @@ def placement_keep(name, plan, rank, world):
     return lambda p: cph.home_rank(p, world, plan.u) == rank
 
 
-def build_store(name, plan, efull, K, V, rank, world, hq, hkv):
+def build_store(name, plan, efull, K, V, rank, world, hq, hkv, paged=False,
+                u=128):
     keep = placement_keep(name, plan, rank, world)
     if name == "ulysses":
         _, ks = cph.schemes.ulysses_heads(world, hq, hkv, rank)
@@ -187,7 +193,63 @@ def build_store(name, plan, efull, K, V, rank, world, hq, hkv):
         base[i] = KeySet(K[i][pos][:, ks].contiguous(),
                          V[i][pos][:, ks].contiguous(), pos,
                          torch.full_like(pos, i))
+    if paged:
+        return PagedBenchStore(base, plan, efull, name, rank, world, u)
     return BenchKVStore(base)
+
+
+class PagedBenchStore:
+    """A vLLM-layout paged cache (block_size = u = interleave) wrapped in
+    PagedKVStore with MSA in place: what the CP_HOLES backend runs. reset()
+    restores the step-start validity; the per-step cache (tables, MSA plans)
+    survives across iterations and layers, as within one step."""
+
+    def __init__(self, base, plan, efull, name, rank, world, u):
+        sharded = name not in ("ulysses", "allgather")
+        w, r = (world, rank) if sharded else (1, 0)
+        some = next(iter(base.values()))
+        dev, dt = some.k.device, some.k.dtype
+        hkv, dh = some.k.shape[1], some.k.shape[2]
+        nblk = [-(-e // (u * w)) for e in efull]
+        perm = torch.randperm(sum(nblk) + 1)
+        tables, lps, off = [], [], 0
+        for e, nb in zip(efull, nblk):
+            bt, lp = cph.kv_store.vllm_local_layout(perm[off:off + nb], nb, u,
+                                                    r, w, u)
+            off += nb
+            tables.append(bt.to(dev))
+            lps.append(torch.where(lp < e, lp, torch.full_like(lp, -1))
+                       .to(dev))
+        cache = torch.zeros(2, len(perm), u, hkv, dh, dtype=dt, device=dev)
+        pres = [torch.zeros_like(lp, dtype=torch.bool) for lp in lps]
+        self.store = cph.kv_store.PagedKVStore(cache, tables, lps, pres,
+                                               in_place=True, step_cache={})
+        for ks in base.values():
+            self.store.write(ks)
+        self.present0 = [p.clone() for p in self.store.present]
+
+    def reset(self):
+        self.store.present = [p.clone() for p in self.present0]
+
+    def write(self, keys):
+        self.store.write(keys)
+
+    def gather(self, reqs, limits):
+        return self.store.gather(reqs, limits)
+
+    def attend(self, q, qpos, qreq, reqs, limits, scale, attn, *a, **kw):
+        if isinstance(attn, NullAttention):  # comm-only timing
+            return attn(q, qpos, qreq, None, scale)
+        if isinstance(attn, TimedAttention):  # time the in-place kernel
+            st, en = torch.cuda.Event(True), torch.cuda.Event(True)
+            st.record()
+            out = self.store.attend(q, qpos, qreq, reqs, limits, scale,
+                                    attn.inner, *a, **kw)
+            en.record()
+            attn.events.append((st, en))
+            return out
+        return self.store.attend(q, qpos, qreq, reqs, limits, scale, attn,
+                                 *a, **kw)
 
 
 def bytes_sent(scheme, plan, rank, world, hq, hkv, dh, elt=2):
@@ -242,7 +304,8 @@ def run_case(args, name, lay, rank, world, comm, dev, local_attn):
     off = torch.tensor([0] + efull[:-1], device=dev).cumsum(0)
     kidx = off[qreq[own]] + qpos[own]
     k, v = torch.cat(K)[kidx], torch.cat(V)[kidx]
-    store = build_store(name, plan, efull, K, V, rank, world, hq, hkv)
+    store = build_store(name, plan, efull, K, V, rank, world, hq, hkv,
+                        paged=args.store == "paged", u=args.u)
     res = {"scheme": name, "layout": lay, "d": world, "E": args.E,
            "m": plan.m, "own_rows": int(own.numel()),
            "bytes_sent": bytes_sent(scheme, plan, rank, world, hq, hkv, dh,
@@ -311,6 +374,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--local-attn", default="tiled")
+    ap.add_argument("--store", default="dense", choices=["dense", "paged"],
+                    help="paged: vLLM-layout paged cache; Ulysses / pass-Q "
+                    "attend in place with MSA (the CP_HOLES backend path)")
     ap.add_argument("--check", action="store_true",
                     help="small shapes, compare with reference attention")
     ap.add_argument("--out", default=None)
