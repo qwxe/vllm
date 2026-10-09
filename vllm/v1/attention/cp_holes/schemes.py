@@ -74,6 +74,8 @@ class _Scheme:
         self.hq, self.hkv, self.dh = hq, hkv, head_dim
         self.attn = local_attn or get_local_attention()
         self.own_rows = torch.empty(0, dtype=torch.int64)
+        # own_rows of every rank (derived from the plan, identical everywhere)
+        self.rows_by_rank: list[torch.Tensor] = []
 
     def _to(self, t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         return t.to(ref.device, non_blocking=True)
@@ -120,7 +122,8 @@ class UlyssesCP(_Scheme):
         sub = plan.m if rows is None else rows
         self.n_mb = n_mb
         self.mb_rows = rows_contiguous(sub, d, n_mb)
-        self.own_rows = torch.cat([self.mb_rows[r][k] for k in range(n_mb)])
+        self.rows_by_rank = [torch.cat(self.mb_rows[x]) for x in range(d)]
+        self.own_rows = self.rows_by_rank[r]
         self.cnt = [[int(self.mb_rows[x][k].numel()) for k in range(n_mb)]
                     for x in range(d)]
         self.mb_all = [torch.cat([self.mb_rows[x][k] for x in range(d)])
@@ -207,7 +210,8 @@ class PassQCP(_Scheme):
         sub = plan.m if rows is None else rows
         self.n_mb = n_mb
         self.mb_rows = rows_contiguous(sub, d, n_mb)
-        self.own_rows = torch.cat([self.mb_rows[me][k] for k in range(n_mb)])
+        self.rows_by_rank = [torch.cat(self.mb_rows[x]) for x in range(d)]
+        self.own_rows = self.rows_by_rank[me]
         self.cnt = [[int(self.mb_rows[x][k].numel()) for k in range(n_mb)]
                     for x in range(d)]
         self.mb = []
@@ -320,6 +324,7 @@ class RingCP(_Scheme):
         d, me = comm.world, comm.rank
         reqs = list(range(plan.num_reqs)) if reqs is None else sorted(reqs)
         self.rows_pr = rows_per_rank or rows_c2e(plan, reqs)
+        self.rows_by_rank = self.rows_pr
         self.own_rows = self.rows_pr[me]
         self.reqs = reqs
         self.lim = [plan.e_step[i] for i in reqs]
@@ -393,6 +398,7 @@ class AllGatherKVCP(_Scheme):
         super().__init__(plan, comm, hq, hkv, head_dim, local_attn)
         reqs = list(range(plan.num_reqs)) if reqs is None else sorted(reqs)
         self.rows_pr = rows_per_rank or rows_c2e(plan, reqs)
+        self.rows_by_rank = self.rows_pr
         self.own_rows = self.rows_pr[comm.rank]
         self.reqs, self.lim = reqs, [plan.e_step[i] for i in reqs]
         self.qpos = plan.qpos[self.own_rows]
@@ -446,9 +452,14 @@ class AdaptiveCP(_Scheme):
         self.pq = PassQCP(plan, comm, hq, hkv, head_dim, self.attn, n_mb=n_mb,
                           rows=rows_of_reqs(plan, self.pq_reqs)) \
             if self.pq_reqs else None
-        parts = [s.own_rows for s in (self.ring, self.pq) if s is not None]
-        self.own_rows = torch.sort(torch.cat(parts)).values if parts else \
-            torch.empty(0, dtype=torch.int64)
+        subs = [x for x in (self.ring, self.pq) if x is not None]
+        self.rows_by_rank = []
+        for x in range(comm.world):
+            parts = [sub.rows_by_rank[x] for sub in subs]
+            self.rows_by_rank.append(
+                torch.sort(torch.cat(parts)).values if parts else
+                torch.empty(0, dtype=torch.int64))
+        self.own_rows = self.rows_by_rank[comm.rank]
         self.idx = {}
         for s in (self.ring, self.pq):
             if s is not None:
