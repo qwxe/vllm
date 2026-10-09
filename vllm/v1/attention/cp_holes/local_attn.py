@@ -178,3 +178,82 @@ def get_local_attention() -> LocalAttention:
 def set_local_attention(fn: LocalAttention) -> None:
     global _default_local_attn
     _default_local_attn = fn
+
+
+class TiledLocalAttention:
+    """A GPU-usable PyTorch implementation of the primitive.
+
+    Per request, keys are sorted by position, so the keys a query may see
+    (kpos <= qpos) are a prefix of the sorted list. Queries are processed in
+    tiles of `q_tile` rows (sorted by position); a tile reads the sorted keys
+    up to its largest limit in chunks of `k_chunk`. A key chunk entirely at or
+    before the tile's smallest query position is a full tile (no mask); only
+    the chunks across the boundary are masked (the host-side tile
+    classification of KERNEL-ALGO 2.1). Scores use the input dtype for the
+    matmuls and fp32 for the softmax. It stands in for the hole-aware kernel
+    (branch holes/kernel) in benchmarks; it is not a fused kernel.
+    """
+
+    def __init__(self, q_tile: int = 256, k_chunk: int = 4096):
+        self.q_tile, self.k_chunk = q_tile, k_chunk
+
+    def __call__(self, q, qpos, qreq, keys: KeySet, scale):
+        rows, hq, dh = q.shape
+        o = torch.zeros(rows, hq, dh, dtype=torch.float32, device=q.device)
+        lse = torch.full((rows, hq), -math.inf, dtype=torch.float32,
+                         device=q.device)
+        if rows == 0 or keys.n == 0:
+            return o, lse
+        hkv = keys.k.shape[1]
+        g = hq // hkv
+        cdt = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else \
+            torch.float32
+        for r in torch.unique(qreq).tolist():
+            qi = (qreq == r).nonzero(as_tuple=True)[0]
+            ki = (keys.kreq == r).nonzero(as_tuple=True)[0]
+            if ki.numel() == 0:
+                continue
+            kp_all = keys.kpos[ki]
+            kord = torch.argsort(kp_all)
+            ki, kp_all = ki[kord], kp_all[kord]
+            qord = torch.argsort(qpos[qi])
+            qi = qi[qord]
+            lim = torch.searchsorted(kp_all, qpos[qi], right=True)
+            lim_cpu = lim.cpu()
+            qp_cpu = qpos[qi].cpu()
+            for t0 in range(0, qi.numel(), self.q_tile):
+                tq = qi[t0:t0 + self.q_tile]
+                hi = int(lim_cpu[t0:t0 + self.q_tile].max())
+                if hi == 0:
+                    continue
+                qmin = int(qp_cpu[t0])
+                qq = q[tq].to(cdt).transpose(0, 1)  # [Hq, nq, D]
+                qp = qpos[tq]
+                po, pl = [], []
+                for c0 in range(0, hi, self.k_chunk):
+                    kc = ki[c0:min(hi, c0 + self.k_chunk)]
+                    kk = keys.k[kc].to(cdt).transpose(0, 1)  # [Hkv, nk, D]
+                    vv = keys.v[kc].to(cdt).transpose(0, 1)
+                    if g > 1:
+                        kk = kk.repeat_interleave(g, dim=0)
+                        vv = vv.repeat_interleave(g, dim=0)
+                    s = torch.matmul(qq, kk.transpose(1, 2)).float() * scale
+                    kp = keys.kpos[kc]
+                    if int(kp.max()) > qmin:  # partial tile: mask
+                        mask = kp.unsqueeze(0) <= qp.unsqueeze(1)
+                        s = s.masked_fill(~mask.unsqueeze(0), -math.inf)
+                    m = s.amax(dim=-1)
+                    m_safe = torch.where(torch.isinf(m), torch.zeros_like(m),
+                                         m)
+                    p = torch.exp(s - m_safe.unsqueeze(-1))
+                    l = p.sum(dim=-1)
+                    oc = torch.matmul(p.to(cdt), vv).float()
+                    oc = oc / torch.where(l > 0, l,
+                                          torch.ones_like(l)).unsqueeze(-1)
+                    po.append(oc.transpose(0, 1))
+                    pl.append(torch.where(l > 0, m_safe + torch.log(l),
+                                          torch.full_like(l, -math.inf)).t())
+                oo, ll = merge_attn_states(po, pl)
+                o[tq] = oo
+                lse[tq] = ll
+        return o, lse
