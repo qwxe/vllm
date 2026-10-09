@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """holes/rate: the session-state `rate` eviction policy (CPU only).
 
 Run with pytest or ``python test_rate_eviction.py``. The simulator parity test
@@ -22,7 +23,6 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.eviction import (
     EvictionConfig,
     RateEvictionPolicy,
-    RateParams,
     chunk_recompute_s,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id

@@ -179,8 +179,12 @@ greedy, ignore_eos):
   - `big`: 5863 blocks, no eviction; this is the reference.
   - `lru` and `rate`: `num_gpu_blocks_override` 1500 or 900.
   - The 900-block arms ran a warm-up first; the 1500-block arms and `big` did not.
-- **Results.** Outputs are identical to the no-eviction reference in every arm: **146/146 requests,
-  token for token**, for both LRU and rate at both cache sizes.
+- **Results.** In the run tabled below, outputs were identical to the no-eviction reference in every
+  arm: **146/146 requests, token for token**, for both LRU and rate at both cache sizes. This identity
+  is run-dependent, not guaranteed: fp32 greedy decoding over a different batch / chunk / hole layout
+  can flip a near-tie. A verifier rerun matched 145/146 for rate; the one divergence (session 10,
+  turn 4, token 2) was a near-tie with a logprob gap of 0.0016, consistent with numerics rather than
+  a wrong KV.
 
 | cache | arm | hit tokens | recomputed prompt tokens | scheduled tokens | hole tokens | preempt | TTFT mean / p50 / p90 (s) | evicted (rate) |
 |---|---|---|---|---|---|---|---|---|
@@ -194,12 +198,15 @@ Notes:
 - **1500 blocks, a tie.** Both arms lose almost the same 12-16 requests. All of those losses fall in
   the arrival burst around t = 30-45 s, when nearly every free block is evicted whatever the order, so
   the policy has little to choose.
-- **900 blocks, rate wins.** It keeps more of the sessions likely to return. It pays in holes:
+- **900 blocks, rate won in this run.** It keeps more of the sessions likely to return. It pays in holes:
   34K hole tokens recomputed, and 2 preemptions. The protected 'queued' / 'prefill' chunks were
   evicted only as a last resort.
 - **Hole tokens include the gaps between holes.** In the hole-tokens column the LRU arms have 0 not
   because LRU leaves no gaps: LRU evicts tail first, so its misses are suffixes, which are recomputed
   as the tail, not as holes.
+- **The lru-vs-rate comparison is run-dependent.** The verifier rerun reversed it: hit rate 50.3 %
+  for rate vs 51.5 % for LRU. With one run per arm the difference between the arms is within
+  run-to-run variation, so the table does not establish that rate beats LRU on this workload.
 - **The numbers are indicative only.** Each arm ran once, in real time on a laptop GPU (TTFT includes
   scheduling jitter). The small model also makes position cost almost flat (b2/b1 is small at <= 8K
   tokens). The paper's regime (100K-token contexts, a lower tier) is not reproduced here.
@@ -207,16 +214,15 @@ Notes:
 Commands (the one GPU job at a time, as `gpurun env PYTHONPATH=/home/asd/vllm-dev-wt/rate <venv python> ...`):
 ```
 python tests/v1/holes/test_rate_eviction.py                                   # CPU
-python tests/v1/holes/gpu_rate_e2e.py workload --out D                        # CPU
+python tests/v1/holes/gpu_rate_e2e.py workload --dataset JSONL --out D        # CPU
 python tests/v1/holes/gpu_rate_e2e.py calib --out D --max-model-len 8192      # GPU, cost fit
 python tests/v1/holes/gpu_rate_e2e.py run --arm big  --out D --max-model-len 8192
 python tests/v1/holes/gpu_rate_e2e.py run --arm lru  --out D --max-model-len 8192 --num-blocks 900
 python tests/v1/holes/gpu_rate_e2e.py run --arm rate --out D --max-model-len 8192 --num-blocks 900
 python tests/v1/holes/gpu_rate_e2e.py report --out D                          # CPU, output equality
 ```
-Each run takes about 5 min (real-time workload). Result JSONs from these runs:
-`/tmp/claude-1000/-home-asd-LLMServingSim/7c099789-b2c4-4dff-94d4-0492313d3b44/scratchpad/e2e/{r1500,r900}/`
-(scratch, not committed).
+Each run takes about 5 min (real-time workload). The result JSONs of these runs were scratch output
+and are not committed.
 
 ## Not done / next
 - A lower tier (CPU pool connector, `SupportsBlockHitMask`) with prefetch / offload. This is future
