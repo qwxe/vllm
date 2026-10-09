@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -26,6 +26,9 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.eviction import RateEvictionPolicy
 
 logger = init_logger(__name__)
 
@@ -180,6 +183,19 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # holes/rate: pluggable eviction. None = stock LRU order of
+        # free_block_queue; every code path below is then the stock one.
+        self.eviction_policy: RateEvictionPolicy | None = None
+
+    def set_eviction_policy(self, policy: "RateEvictionPolicy | None") -> None:
+        """Install an eviction policy (holes/rate). It decides which cached
+        free blocks are evicted; the free queue still holds every free block
+        (membership, count), but allocation no longer pops its head."""
+        self.eviction_policy = policy
+        if policy is not None:
+            assert self.enable_caching, "an eviction policy needs prefix caching"
+            policy.attach(self)
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -331,7 +347,12 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.eviction_policy is not None:
+            # holes/rate: uncached free blocks first, then the policy's victims
+            # (already evicted from the cache, so the loop below only counts).
+            ret = self.eviction_policy.take_free(num_blocks)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -375,6 +396,14 @@ class BlockPool:
             return False
 
         block.reset_hash()
+        if (
+            self.eviction_policy is not None
+            and block.ref_cnt == 0
+            and not block.is_null
+        ):
+            # A free block lost its hash (connector / test eviction, or the
+            # policy's own victim): it is now plain free space.
+            self.eviction_policy.on_uncache(block)
 
         if self.enable_kv_cache_events:
             # FIXME (Chen): Not sure whether we should return `hash_value`
@@ -402,6 +431,8 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                if self.eviction_policy is not None:
+                    self.eviction_policy.on_remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -418,9 +449,13 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        freed = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        self.free_block_queue.append_n(freed)
+        if self.eviction_policy is not None:
+            for block in freed:
+                self.eviction_policy.on_free(block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -468,6 +503,9 @@ class BlockPool:
 
         if self.metrics_collector:
             self.metrics_collector.reset()
+
+        if self.eviction_policy is not None:
+            self.eviction_policy.reset()
 
         logger.info("Successfully reset prefix cache")
 

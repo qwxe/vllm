@@ -39,6 +39,11 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.eviction import (
+    get_eviction_config,
+    make_eviction_policy,
+    session_id_of,
+)
 from vllm.v1.core.holes import (
     cp_step_budget,
     get_hole_config,
@@ -283,6 +288,10 @@ class Scheduler(SchedulerInterface):
         self._warned_async_mask = False
         self._step_hole_ranges: dict[str, list[tuple[int, int]]] = {}
         self._extra_segments = 0
+
+        # holes/rate: pluggable eviction of cached GPU blocks (LRU = stock).
+        self.eviction_config = get_eviction_config(vllm_config)
+        self.eviction_policy = self._make_eviction_policy(kv_cache_config)
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -1610,6 +1619,9 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
+                if self.eviction_policy is not None:
+                    # holes/rate: the first sampled token ends the prefill.
+                    self.eviction_policy.on_prefill_done(req_id)
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
@@ -1942,6 +1954,42 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
+    def _make_eviction_policy(self, kv_cache_config: KVCacheConfig):
+        cfg = self.eviction_config
+        if cfg.policy == "lru":
+            return None
+        reason = None
+        if not self.cache_config.enable_prefix_caching:
+            reason = "prefix caching is off"
+        elif len(kv_cache_config.kv_cache_groups) != 1:
+            reason = "it supports one KV cache group only"
+        elif self.connector is not None:
+            reason = "KV connectors manage the GPU pool themselves"
+        elif self.dcp_world_size > 1 or self.pcp_world_size > 1:
+            reason = "DCP / PCP are not supported"
+        if reason is not None:
+            logger.warning(
+                "Eviction policy %r ignored (%s); using LRU.", cfg.policy, reason
+            )
+            return None
+        block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        policy = make_eviction_policy(cfg, block_size)
+        self.kv_cache_manager.block_pool.set_eviction_policy(policy)
+        if not self.holes_enabled:
+            logger.warning(
+                "Eviction policy %r without hole-aware lookup: a cache hit "
+                "stops at the first evicted chunk. Enable holes too.",
+                cfg.policy,
+            )
+        logger.info(
+            "Eviction policy %r: %d-token chunks (%d blocks), rescore %.3g s.",
+            cfg.policy,
+            policy.chunk_tokens,
+            policy.blocks_per_chunk,
+            cfg.rescore_s,
+        )
+        return policy
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -1961,6 +2009,10 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self.eviction_policy is not None:
+                self.eviction_policy.on_arrival(
+                    request.request_id, session_id_of(request)
+                )
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -2031,6 +2083,8 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+        if self.eviction_policy is not None:
+            self.eviction_policy.on_finished(request.request_id)
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
