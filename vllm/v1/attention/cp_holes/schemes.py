@@ -78,7 +78,18 @@ class _Scheme:
         self.rows_by_rank: list[torch.Tensor] = []
 
     def _to(self, t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-        return t.to(ref.device, non_blocking=True)
+        """Device copy of a plan-derived index tensor, made once per step.
+
+        The plan's tensors live on the host; every layer reuses the copies.
+        """
+        if t.device == ref.device:
+            return t
+        cache = self.__dict__.setdefault("_dev", {})
+        hit = cache.get(id(t))
+        if hit is None or hit[0] is not t or hit[1].device != ref.device:
+            hit = (t, t.to(ref.device, non_blocking=False))
+            cache[id(t)] = hit
+        return hit[1]
 
 
 # --------------------------------------------------------------------- Ulysses
@@ -403,6 +414,8 @@ class AllGatherKVCP(_Scheme):
         self.reqs, self.lim = reqs, [plan.e_step[i] for i in reqs]
         self.qpos = plan.qpos[self.own_rows]
         self.qreq = plan.qreq[self.own_rows]
+        self.new_pos = [plan.qpos[rx] for rx in self.rows_pr]
+        self.new_req = [plan.qreq[rx] for rx in self.rows_pr]
 
     def forward(self, q, k, v, store: CPKVStore, scale: float):
         dt, Hkv, D = q.dtype, self.hkv, self.dh
@@ -418,9 +431,8 @@ class AllGatherKVCP(_Scheme):
         new = []
         for x, b in enumerate(outs):
             kk, vv = unpack_rows(b, spec)
-            rx = self.rows_pr[x]
-            new.append(KeySet(kk, vv, self._to(self.plan.qpos[rx], q),
-                              self._to(self.plan.qreq[rx], q)))
+            new.append(KeySet(kk, vv, self._to(self.new_pos[x], q),
+                              self._to(self.new_req[x], q)))
         new = KeySet.cat(new)
         store.write(new)
         o2, l2 = self.attn(q, qpos, qreq, new, scale)
