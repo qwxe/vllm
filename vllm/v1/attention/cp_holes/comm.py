@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Byte-packed collectives for the CP schemes.
 
 Every payload is packed row-wise into uint8 so that one collective carries

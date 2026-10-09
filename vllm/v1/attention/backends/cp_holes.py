@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CP_HOLES: a context-parallel attention backend for holed prefills.
 
 Plugs the schemes of `vllm.v1.attention.cp_holes` into vLLM's attention

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Context parallelism for prefills whose cached context has holes.
 
 See CP-IMPL.md at the repository root for the design as built.

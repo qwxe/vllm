@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Synced from the standalone repo /home/asd/vllm-dev-kernels (msa/).
+# Synced from the standalone MSA kernel repo (its msa/ package).
 """Triton kernels for position-explicit multi-segment paged attention (MSA).
 
 Derived from vLLM v0.19.0's `triton_unified_attention` (GQA-packed q tiles over a

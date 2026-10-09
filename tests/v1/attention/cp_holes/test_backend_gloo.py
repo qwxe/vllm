@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """gloo test of the CP_HOLES backend glue (metadata builder + impl).
 
 Drives `CPHolesMetadataBuilder.build` and `CPHolesImpl.forward` in the

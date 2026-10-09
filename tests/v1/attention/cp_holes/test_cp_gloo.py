@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU (gloo) correctness tests of the CP schemes for holed prefills.
 
 Each test spawns `world` CPU processes, builds the same random holed step on

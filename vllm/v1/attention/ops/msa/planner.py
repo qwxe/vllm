@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Synced from the standalone repo /home/asd/vllm-dev-kernels (msa/).
+# Synced from the standalone MSA kernel repo (its msa/ package).
 """Host planner for MSA: segments -> q tiles -> work items (KERNEL-ALGO.md 2.5 / 2.7).
 
 Input is a CPU description of the launch:
@@ -215,7 +215,6 @@ def plan_msa(
     else:
         t_req = t_qmin = t_qmax = np.zeros(0, dtype=np.int64)
         t_rows = np.zeros((0, bq), dtype=np.int64)
-    n_tiles = len(t_req)
 
     # ---- key bounds per tile --------------------------------------------------------
     if qpos is None:

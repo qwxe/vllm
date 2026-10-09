@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """holes/core: chunk planner (KERNEL-ALGO 5.2) and range helpers. CPU only."""
 
 from vllm.v1.core.holes import (

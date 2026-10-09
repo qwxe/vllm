@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Greedy outputs + first-token logprobs of CP_HOLES vs a stock backend.
 
     gpurun env PYTHONPATH=<wt> <venv>/bin/python gpu_cp_holes_vs_stock.py \

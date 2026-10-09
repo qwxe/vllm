@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """holes/core GPU end-to-end check (run through gpurun, one short process).
 
 Creates holes artificially in a cached prefix (test hook), runs the request
@@ -11,7 +12,6 @@ Usage: python gpu_holes_e2e.py [--eager] [--backend FLASH_ATTN|TRITON_ATTN|FLASH
 
 import argparse
 import os
-import random
 import sys
 import time
 
@@ -66,9 +66,6 @@ def main():
         return out
 
     sched.schedule = schedule_spy
-
-    rng = random.Random(0)
-    vocab = 150000
 
     tok = llm.get_tokenizer()
     import this  # noqa: F401  (Zen of Python, natural text)

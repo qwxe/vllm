@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ParallelConfig.cp_kv_placement: KV accounting, KV spec heads, slot mapping.
 
 CPU part: the config property, per-rank capacity, KV heads per rank.

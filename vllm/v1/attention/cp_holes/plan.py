@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Step plan, KV placement and row partitioners for CP holed prefills.
 
 A `StepPlan` is the global description of one prefill step. It is built from

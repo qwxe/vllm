@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU: CP_HOLES local attention through MSA.
 
 1. `AutoLocalAttention` (MSA on CUDA) vs `RefLocalAttention` on gathered
@@ -11,8 +12,6 @@
 
     gpurun env PYTHONPATH=<wt> <venv>/bin/python test_msa_paged_gpu.py
 """
-
-import math
 
 import torch
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Position-explicit local attention for context-parallel holed prefills.
 
 Every CP scheme in this package reduces its per-rank work to one primitive

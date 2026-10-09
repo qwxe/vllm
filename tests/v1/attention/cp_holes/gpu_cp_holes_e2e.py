@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Real-vLLM one-GPU check of the CP_HOLES backend (CP world size 1).
 
 Runs holes/core's end-to-end check (`tests/v1/holes/gpu_holes_e2e.py`: holes
