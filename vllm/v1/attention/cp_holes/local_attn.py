@@ -87,11 +87,52 @@ def merge_attn_states(o_list: Sequence[torch.Tensor],
     o_p: [rows, H, D] (any float dtype), lse_p: [rows, H] fp32.
     LSE = logsumexp_p LSE_p; O = sum_p exp(LSE_p - LSE) O_p. Partials with
     LSE = -inf contribute nothing; a row with every partial at -inf stays at
-    O = 0, LSE = -inf.
+    O = 0, LSE = -inf. O comes back in fp32 (torch path) or in the partials'
+    dtype (fused path on CUDA); callers cast.
     """
     assert len(o_list) == len(lse_list) and len(o_list) > 0
     if len(o_list) == 1:
         return o_list[0].float(), lse_list[0].float()
+    fused = _fused_combine()
+    dh = o_list[0].shape[-1]
+    if fused is not None and o_list[0].is_cuda and dh & (dh - 1) == 0 \
+            and o_list[0].shape[0] > 0:
+        dts = {o.dtype for o in o_list}
+        o = torch.stack(o_list if len(dts) == 1 else
+                        [x.float() for x in o_list])
+        lse = torch.stack([x.float() for x in lse_list])
+        return fused(o, lse, return_lse=True)
+    return merge_attn_states_torch(o_list, lse_list)
+
+
+_FUSED = None
+
+
+def _fused_combine():
+    """vLLM's DCP Triton LSE combine (`dcp_lse_combine_triton`), if present.
+
+    It takes [N, B, H, D] partials and [N, B, H] LSEs, handles empty partials
+    (LSE = -inf), and returns O in the partials' dtype. Disabled with
+    CP_HOLES_TORCH_MERGE=1.
+    """
+    global _FUSED
+    if _FUSED is None:
+        _FUSED = False
+        import os
+        if os.environ.get("CP_HOLES_TORCH_MERGE", "0") != "1":
+            try:
+                from vllm.v1.attention.ops.dcp_alltoall import (
+                    dcp_lse_combine_triton)
+                _FUSED = dcp_lse_combine_triton
+            except Exception:
+                _FUSED = False
+    return _FUSED or None
+
+
+def merge_attn_states_torch(o_list: Sequence[torch.Tensor],
+                            lse_list: Sequence[torch.Tensor]
+                            ) -> tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch LSE merge (the reference for the fused path)."""
     lse = torch.stack([x.float() for x in lse_list])  # [P, rows, H]
     lse_max = lse.max(dim=0).values
     # Rows where every partial is empty: keep -inf and avoid nan.
