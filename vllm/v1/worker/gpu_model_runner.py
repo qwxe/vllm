@@ -1852,6 +1852,7 @@ class GPUModelRunner(
                 num_scheduled_tokens,
                 self.input_batch.num_computed_tokens_cpu[:num_reqs],
                 positions_np,
+                missing_ranges=scheduler_output.missing_kv_ranges,
             )
         self._hole_segments = hole_segments
 

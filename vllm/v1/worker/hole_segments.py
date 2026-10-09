@@ -47,6 +47,9 @@ class HoleSegments:
     """(S,) int32: e_i, the segment's end position = its seq_len."""
     req_hole_tokens: np.ndarray
     """(num_reqs,) int32: hole tokens of each request in this step."""
+    req_missing_ranges: list[list[tuple[int, int]]] | None = None
+    """holes/cp: per request row, the token ranges whose KV is still missing
+    after this step (SchedulerOutput.missing_kv_ranges); None = not given."""
 
     @property
     def num_segments(self) -> int:
@@ -68,6 +71,7 @@ def build_hole_segments(
     num_scheduled_tokens: np.ndarray,
     num_computed_tokens: np.ndarray,
     positions: np.ndarray,
+    missing_ranges: dict[str, list[tuple[int, int]]] | None = None,
 ) -> HoleSegments:
     """Build the segment view and rewrite ``positions`` in place.
 
@@ -120,6 +124,9 @@ def build_hole_segments(
         seg_query_lens=np.asarray(seg_q, dtype=np.int32),
         seg_ends=np.asarray(seg_end, dtype=np.int32),
         req_hole_tokens=hole_tok,
+        req_missing_ranges=None
+        if missing_ranges is None
+        else [list(missing_ranges.get(r, ())) for r in req_ids],
     )
 
 

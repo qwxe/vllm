@@ -159,7 +159,8 @@ class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
     def build(self, common_prefix_len: int,
               common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> CPHolesMetadata:
-        segs, bt_rows, seq_lens = request_segments(common_attn_metadata)
+        segs, bt_rows, seq_lens, missing = request_segments(
+            common_attn_metadata)
         n = len(segs)
         d = self.comm.world
         sharded = self.scheme_name in _POSITION_SHARDED
@@ -181,12 +182,9 @@ class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
             bt, lp = vllm_local_layout(bt_cpu[i], nb, self.block_size, r, w,
                                        self.interleave if sharded else
                                        self.block_size)
-            comp = torch.zeros(e + 1, dtype=torch.bool)
-            for s, ln in plan.segments[i]:
-                comp[s:s + ln] = True
+            pr = kv_slot_validity(lp, e, plan.segments[i], missing[i],
+                                  plan.e_step[i])
             ok = (lp >= 0) & (lp < e)
-            pr = ok.clone()
-            pr[ok] = ~comp[lp[ok]]
             dev = self.device
             tables.append(bt.to(dev))
             lpos.append(torch.where(ok, lp, torch.full_like(lp, -1)).to(dev))
@@ -196,6 +194,36 @@ class CPHolesMetadataBuilder(AttentionMetadataBuilder[CPHolesMetadata]):
                                plan=plan, scheme=scheme, block_tables=tables,
                                local_pos=lpos, present=present,
                                dense=self.dense)
+
+
+def kv_slot_validity(local_pos: torch.Tensor, e: int,
+                     segments: list[tuple[int, int]],
+                     missing: list[tuple[int, int]] | None,
+                     e_step: int) -> torch.Tensor:
+    """Which local slots hold valid KV at the start of the step.
+
+    A slot is valid when its position is below the request's end, is not
+    computed in this step (written during the step), and is not in the
+    scheduler's missing-KV ranges (holes/core's block hit-mask misses not
+    computed yet; `SchedulerOutput.missing_kv_ranges`). Without that list
+    (`missing is None`, e.g. a step without holes) every non-computed position
+    below the end counts as resident, which is exact for stock prefix caching.
+    A missing range below E_step would be read by a query of this step: that
+    is a scheduling bug and raises.
+    """
+    bad = torch.zeros(e + 1, dtype=torch.bool)
+    for s0, ln in segments:
+        bad[s0:s0 + ln] = True
+    for a, b in missing or ():
+        if a < e_step:
+            raise ValueError(
+                f"CP_HOLES: KV of [{a}, {b}) is missing but the step computes "
+                f"queries up to {e_step}")
+        bad[min(a, e + 1):min(b, e + 1)] = True
+    ok = (local_pos >= 0) & (local_pos < e)
+    pr = ok.clone()
+    pr[ok] = ~bad[local_pos[ok]]
+    return pr
 
 
 def request_segments(cam):
@@ -211,7 +239,7 @@ def request_segments(cam):
     request with the single segment [seq_len - q_len, seq_len).
 
     Returns (segments [[(start, length)]], block-table rows [n, max_blocks],
-    seq_ends [n]).
+    seq_ends [n], missing-KV ranges per request or None each).
     """
     hs = getattr(cam, "hole_segments", None)
     if hs is None:
@@ -220,7 +248,7 @@ def request_segments(cam):
         qsl = cam.query_start_loc_cpu[:n + 1].tolist()
         segs = [[(seq[i] - (qsl[i + 1] - qsl[i]), qsl[i + 1] - qsl[i])]
                 for i in range(n)]
-        return segs, cam.block_table_tensor[:n], seq
+        return segs, cam.block_table_tensor[:n], seq, [None] * n
     req = hs.seg_req_idx.tolist()
     q = hs.seg_query_lens.tolist()
     ends = hs.seg_ends.tolist()
@@ -236,7 +264,9 @@ def request_segments(cam):
         seq[-1] = max(seq[-1], ends[k])
     rows = torch.tensor(first, dtype=torch.int64,
                         device=cam.block_table_tensor.device)
-    return segs, cam.block_table_tensor.index_select(0, rows), seq
+    rm = getattr(hs, "req_missing_ranges", None)
+    missing = [None if rm is None else list(rm[req[k]]) for k in first]
+    return segs, cam.block_table_tensor.index_select(0, rows), seq, missing
 
 
 class CPHolesImpl(AttentionImpl[CPHolesMetadata]):

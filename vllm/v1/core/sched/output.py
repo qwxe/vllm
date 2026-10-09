@@ -249,6 +249,14 @@ class SchedulerOutput:
         default_factory=dict
     )
 
+    # holes/cp: req_id -> token ranges below the request's frontier whose KV
+    # is still missing on the GPU after this step (the misses of the
+    # per-block hit mask not computed yet, i.e. the pending hole ranges).
+    # Only requests with such ranges appear. Attention must not read them.
+    missing_kv_ranges: dict[str, list[tuple[int, int]]] = field(
+        default_factory=dict
+    )
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

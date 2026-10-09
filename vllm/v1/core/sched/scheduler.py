@@ -1193,6 +1193,11 @@ class Scheduler(SchedulerInterface):
                 request.pending_hole_ranges = subtract_ranges(
                     request.pending_hole_ranges, pieces
                 )
+            if request.pending_hole_ranges:
+                # holes/cp: KV still missing after this step (hit-mask misses).
+                scheduler_output.missing_kv_ranges[req_id] = list(
+                    request.pending_hole_ranges
+                )
             request.num_computed_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
