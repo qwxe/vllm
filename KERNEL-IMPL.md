@@ -12,8 +12,8 @@ copy. Every GPU job went through `.wt/bin/gpurun`, using the venv `/home/asd/LLM
 ## 0. Summary
 
 1. **Correct.**
-   - Standalone suite: 249/249 checks pass against a pure-PyTorch fp32 reference. Max error is 9e-3 on O (bf16
-     rounding) and 3e-6 on LSE. The suite covers random holes, 1-16 segments, pieces of 1 to 16K tokens, depth to
+   - Standalone suite: 255/255 checks pass against a pure-PyTorch fp32 reference. Max error is 9e-3 on O (bf16
+     rounding) and 3e-6 on LSE (1e-3 for fp32 inputs, TF32 dots). The suite covers random holes, 1-16 segments, pieces of 1 to 16K tokens, depth to
      128K, GQA 32/8, 8/2, 4/1, 8/1, 2/2 and 14/2, head_dim 64 and 128, fp32 inputs, every planner mode with and
      without forced splitting, packing with straddling pieces, interleaved pass-Q shards, and empty rows.
    - CP adapters: 13/13 checks against the CP branch's own `RefLocalAttention`.
@@ -267,7 +267,7 @@ per-segment lookups" over-charges this shape (KERNEL-ALGO 2.2). The real cost is
 
 | suite | command | result |
 |---|---|---|
-| standalone correctness | `gpurun python tests/test_correctness.py` | 249/249 PASS (`results/correctness.tsv`) |
+| standalone correctness | `gpurun python tests/test_correctness.py` | 255/255 PASS (`results/correctness.tsv`) |
 | CP adapters vs holes/cp `RefLocalAttention` | `gpurun python tests/test_cp_adapter.py` | 13/13 PASS (`results/cp_adapter.log`) |
 | stock vLLM 0.19, MSA as CUSTOM, Qwen2.5-0.5B bf16 (chunked prefill 512, prefix-cache hits, decode) | `gpurun python tests/e2e_vllm.py CUSTOM` | correct text. Greedy tokens match TRITON_ATTN on 5/7 prompts. The other two are near-ties, where FA2 and Triton also disagree with each other. First-token logprob deltas: MSA-Triton up to 0.25, FA2-Triton up to 0.30 (`results/e2e_compare.txt`) |
 | holed vLLM (holes/core + MSA), fp32 eager | `gpurun env PYTHONPATH=/home/asd/vllm-dev-wt/kernel-int python tests/v1/holes/gpu_holes_e2e.py --eager --dtype float32 --gpu-util 0.75 --backend MSA` | **PASS**: 8/8 cases token-identical to a full recompute. Holed dlp 0.001-0.011, stock noise 0.009, limit 0.019. Only hole + tail tokens were computed (e.g. 1032 of 3000) |
