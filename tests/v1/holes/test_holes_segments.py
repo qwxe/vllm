@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """holes/core: model-runner segment view and its attention semantics (CPU)."""
 
 import numpy as np
