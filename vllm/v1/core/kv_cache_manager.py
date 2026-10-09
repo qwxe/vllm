@@ -8,6 +8,12 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.holes import (
+    HoleConfig,
+    Range,
+    apply_min_reuse,
+    hits_to_holes,
+)
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -116,6 +122,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        hole_config: HoleConfig | None = None,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -151,6 +158,21 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+        # holes/core: hole-aware lookup (off by default).
+        self.hole_config = hole_config or HoleConfig()
+        self.holes_enabled = (
+            self.hole_config.enabled
+            and enable_caching
+            and self.coordinator.supports_holes
+        )
+        if self.hole_config.enabled and not self.holes_enabled:
+            logger.warning(
+                "Hole-aware prefix caching was requested but is not supported "
+                "for this configuration (needs prefix caching, a single "
+                "full-attention KV cache group, no DCP/PCP, no EAGLE); "
+                "falling back to prefix-only lookup."
+            )
 
     @property
     def usage(self) -> float:
@@ -215,6 +237,100 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    def get_cache_hits_with_holes(
+        self, request: Request
+    ) -> tuple[list[KVCacheBlock | None], int]:
+        """holes/core: per-block lookup of the request's prompt that continues
+        past misses.
+
+        Returns (per-block hits up to the last hit, None for a miss; the
+        block size). Trailing misses are dropped; hit runs after a hole that
+        are shorter than ``min_reuse_blocks`` are turned into misses. Like
+        get_computed_blocks, at most ``num_tokens - 1`` tokens can hit, so the
+        last token is always computed (its logits are needed).
+        """
+        assert self.holes_enabled
+        bs = self.coordinator.block_size  # type: ignore[attr-defined]
+        if request.skip_reading_prefix_cache:
+            return [], bs
+        per_block = self.coordinator.find_cache_hits_with_holes(
+            request.block_hashes, request.num_tokens - 1
+        )
+        hit = apply_min_reuse(
+            [b is not None for b in per_block], self.hole_config.min_reuse_blocks
+        )
+        return [per_block[i][0] if h else None for i, h in enumerate(hit)], bs  # type: ignore[index]
+
+    def get_computed_blocks_with_holes(
+        self,
+        request: Request,
+        external_hit_mask: list[bool] | None = None,
+    ) -> tuple[KVCacheBlocks, int, list[Range], list[Range]]:
+        """holes/core: like get_computed_blocks, but the cache hit may contain
+        holes.
+
+        Args:
+            request: The request.
+            external_hit_mask: optional per-block mask of blocks a KV
+                connector can load (see SupportsBlockHitMask). Blocks it
+                covers that miss locally are loaded instead of recomputed.
+
+        Returns:
+            - KVCacheBlocks up to the frontier, with the null block at every
+              block that is not a local hit (allocated in place by
+              allocate_slots);
+            - the frontier: the token index after the last hit block
+              (becomes request.num_computed_tokens);
+            - the holes to recompute (token ranges, block aligned, sorted);
+            - the ranges the connector loads (subset of the null blocks).
+        """
+        if request.skip_reading_prefix_cache:
+            return self.empty_kv_cache_blocks, 0, [], []
+        local, bs = self.get_cache_hits_with_holes(request)
+        local_hit = [b is not None for b in local]
+        if external_hit_mask:
+            n = min(len(external_hit_mask), (request.num_tokens - 1) // bs)
+            n = max(n, len(local_hit))
+            combined = [
+                (i < len(local_hit) and local_hit[i])
+                or (i < len(external_hit_mask) and bool(external_hit_mask[i]))
+                for i in range(n)
+            ]
+            combined = apply_min_reuse(combined, self.hole_config.min_reuse_blocks)
+            # Keep only local hits that survived the trimming.
+            local = [
+                (local[i] if i < len(local) and combined[i] else None)
+                for i in range(len(combined))
+            ]
+            loaded = [
+                combined[i] and local[i] is None for i in range(len(combined))
+            ]
+        else:
+            combined = local_hit
+            loaded = [False] * len(combined)
+
+        null = self.block_pool.null_block
+        blocks = [b if b is not None else null for b in local]
+        holes = hits_to_holes(combined, bs)
+        load_ranges = hits_to_holes([not x for x in loaded], bs)
+        frontier = len(combined) * bs
+
+        if self.log_stats:
+            assert self.prefix_cache_stats is not None
+            self.prefix_cache_stats.record(
+                num_tokens=request.num_tokens,
+                num_hits=sum(b is not None for b in local) * bs,
+                preempted=request.num_preemptions > 0,
+            )
+        if not blocks:
+            return self.empty_kv_cache_blocks, 0, [], []
+        return (
+            KVCacheBlocks((blocks,)),
+            frontier,
+            holes,
+            load_ranges,
+        )
+
     def can_fit_full_sequence(
         self,
         request: Request,
@@ -250,7 +366,7 @@ class KVCacheManager:
             num_encoder_tokens=num_encoder_tokens,
             total_computed_tokens=total_computed_tokens,
             num_tokens_main_model=full_num_tokens,
-        )
+        ) + self._num_hole_blocks(new_computed_block_list)
 
         return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
 
@@ -264,6 +380,7 @@ class KVCacheManager:
         num_external_computed_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        hole_ranges: list[Range] | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -285,6 +402,15 @@ class KVCacheManager:
             num_encoder_tokens: The number of encoder tokens to allocate for
                 cross-attention in encoder-decoder models(e.g., Whisper).
                 For decoder-only models, this should be 0.
+            hole_ranges: holes/core. Token ranges below the frontier that are
+                computed in this step (hole pieces). Their blocks were
+                allocated in place at admission; they are cached here.
+                With holes, `num_new_tokens` counts only the tail tokens
+                and may be 0.
+
+        holes/core: for a new request, `new_computed_blocks` may contain the
+        null block at hole positions; a fresh block is allocated in place for
+        each of them (and counted against the free blocks).
 
         Blocks layout:
         ```
@@ -338,7 +464,7 @@ class KVCacheManager:
         """
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
-        if num_new_tokens == 0 and num_external_computed_tokens == 0:
+        if num_new_tokens == 0 and num_external_computed_tokens == 0 and not hole_ranges:
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
                 "external computed tokens"
@@ -383,12 +509,20 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
+        num_hole_blocks = self._num_hole_blocks(new_computed_block_list)
+        num_blocks_to_allocate += num_hole_blocks
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
             return None
 
-        if (
+        if num_hole_blocks > 0:
+            # holes/core: touch the hits, allocate the hole blocks in place.
+            assert num_external_computed_tokens == 0
+            self.coordinator.allocate_new_computed_blocks_with_holes(
+                request.request_id, new_computed_block_list
+            )
+        elif (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
         ):
@@ -423,8 +557,42 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        if hole_ranges:
+            self.coordinator.cache_hole_blocks(request, hole_ranges)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _num_hole_blocks(
+        self, new_computed_block_list: tuple[Sequence[KVCacheBlock], ...]
+    ) -> int:
+        """holes/core: null blocks in a new request's hits are holes."""
+        if not self.holes_enabled or not new_computed_block_list:
+            return 0
+        return sum(1 for b in new_computed_block_list[0] if b.is_null)
+
+    def cache_hole_blocks(self, request: Request, ranges: list[Range]) -> None:
+        """holes/core: cache the hole blocks covered by ``ranges`` (e.g. the
+        ranges a connector finished loading)."""
+        if self.enable_caching and ranges:
+            self.coordinator.cache_hole_blocks(request, ranges)
+
+    def evict_cached_token_range(
+        self, request: Request, start: int, end: int
+    ) -> int:
+        """holes/core test hook: drop the cached blocks of ``request``'s
+        prompt whose tokens lie in [start, end) from the prefix cache (by
+        hash), as if a lower tier had evicted them. Blocks still in use keep
+        their KV but are no longer findable. Returns the number of blocks
+        removed from the cache."""
+        bs = self.coordinator.block_size  # type: ignore[attr-defined]
+        ids: set[int] = set()
+        for i in range(start // bs, min(end // bs, len(request.block_hashes))):
+            hit = self.block_pool.get_cached_block(request.block_hashes[i], [0])
+            while hit is not None:
+                ids.add(hit[0].block_id)
+                self.block_pool.evict_blocks({hit[0].block_id})
+                hit = self.block_pool.get_cached_block(request.block_hashes[i], [0])
+        return len(ids)
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
