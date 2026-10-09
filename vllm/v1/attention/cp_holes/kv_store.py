@@ -131,3 +131,41 @@ class PagedKVStore:
             return KeySet.empty(flat.shape[2], flat.shape[3], flat.dtype,
                                 flat.device)
         return KeySet.cat(parts)
+
+
+def vllm_local_layout(block_table_row: torch.Tensor, num_blocks: int,
+                      block_size: int, rank: int, world: int,
+                      interleave: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Local slots of one request under vLLM's CP KV placement.
+
+    vLLM (v1/worker/block_table.py `_compute_slot_mapping_kernel`) maps
+    position p of a request to virtual block b = p // (block_size * world);
+    with vbo = p - b * block_size * world, p is local to rank
+    (vbo // interleave) % world, at local offset
+    (vbo // (world * interleave)) * interleave + vbo % interleave of the
+    rank's physical block block_table_row[b]. Every rank uses the same logical
+    block ids. This returns (block ids in local order, absolute position of
+    every local slot) for a PagedKVStore. interleave = block_size = u gives the
+    u-token interleave of KERNEL-ALGO 4.0 (u = 128 needs block_size 128).
+    world = 1 gives the plain (and the Ulysses head-sharded) layout.
+    """
+    assert block_size % interleave == 0
+    o = torch.arange(block_size, dtype=torch.int64)
+    vbo = (o // interleave) * world * interleave + rank * interleave + \
+        o % interleave
+    b = torch.arange(num_blocks, dtype=torch.int64)
+    pos = (b.unsqueeze(1) * block_size * world + vbo.unsqueeze(0)).reshape(-1)
+    return block_table_row[:num_blocks].to(torch.int64), pos
+
+
+def vllm_slot_mapping(block_table_row: torch.Tensor, pos: torch.Tensor,
+                      block_size: int, rank: int, world: int,
+                      interleave: int) -> torch.Tensor:
+    """Torch port of vLLM's CP slot mapping (-1 for positions not local)."""
+    vbs = block_size * world
+    b = pos // vbs
+    vbo = pos - b * vbs
+    local = (vbo // interleave) % world == rank
+    off = (vbo // (world * interleave)) * interleave + vbo % interleave
+    slot = block_table_row.to(torch.int64)[b] * block_size + off
+    return torch.where(local, slot, torch.full_like(slot, -1))

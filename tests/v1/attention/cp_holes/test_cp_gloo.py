@@ -162,7 +162,12 @@ def run_scheme(name, rank, world, cfg):
     own = scheme.own_rows
     errs = []
     for L in range(layers):
-        store = RefKVStore(hkv_store, dh, dtype, torch.device("cpu"))
+        if cfg.get("store") == "paged":
+            store = make_paged_store(plan, efull, name, rank, world,
+                                     hkv_store, dh, dtype, cfg["u"],
+                                     cfg["seed"] + L)
+        else:
+            store = RefKVStore(hkv_store, dh, dtype, torch.device("cpu"))
         for i in range(plan.num_reqs):
             store.write(resident_keys(plan, efull, i, L, Ks, Vs, keep_fn))
         o = scheme.forward(Q[L][own], _rows_kv(plan, K[L], own),
@@ -174,7 +179,7 @@ def run_scheme(name, rank, world, cfg):
         for i in range(plan.num_reqs):
             cm = plan.computed_mask(i).nonzero(as_tuple=True)[0]
             cm = cm[keep_fn(cm)]
-            got = store.data.get(i)
+            got = store.gather([i], [10**9])
             want_n = int(cm.numel()) + int(
                 resident_keys(plan, efull, i, L, Ks, Vs, keep_fn).n)
             n = 0 if got is None else got.n
@@ -185,6 +190,44 @@ def run_scheme(name, rank, world, cfg):
                 assert torch.equal(got.k[sel], Ks[L][i][cm]), "bad K write"
                 assert torch.equal(got.v[sel], Vs[L][i][cm]), "bad V write"
     return max(errs), int(own.numel())
+
+
+def make_paged_store(plan, efull, name, rank, world, hkv, dh, dtype, u,
+                     seed):
+    """A PagedKVStore over vLLM's CP layout with random block ids.
+
+    Position-sharded schemes use block_size = interleave = u over the CP world;
+    Ulysses / all-gather use the plain layout (world 1 placement).
+    """
+    sharded = name not in ("ulysses", "allgather")
+    w, r = (world, rank) if sharded else (1, 0)
+    bs = u
+    g = torch.Generator().manual_seed(seed)
+    nblk = [-(-e // (bs * w)) for e in efull]
+    perm = torch.randperm(sum(nblk) + 3, generator=g)
+    tables, lpos, present, off = [], [], [], 0
+    for e, nb in zip(efull, nblk):
+        row = perm[off:off + nb]
+        off += nb
+        bt, lp = cph.kv_store.vllm_local_layout(row, nb, bs, r, w, bs)
+        lp = torch.where(lp < e, lp, torch.full_like(lp, -1))
+        tables.append(bt)
+        lpos.append(lp)
+        present.append(torch.zeros_like(lp, dtype=torch.bool))
+        # the store's slots agree with vLLM's slot mapping
+        sm = cph.kv_store.vllm_slot_mapping(row, torch.arange(e), bs, r, w,
+                                            bs)
+        loc = sm >= 0
+        j = (lp >= 0).nonzero(as_tuple=True)[0]
+        mine = torch.arange(e)[loc]
+        assert torch.equal(torch.sort(lp[j]).values, mine)
+        assert torch.equal(
+            bt[j // bs] * bs + j % bs,
+            sm[lp[j]]), "store slots differ from vLLM slot mapping"
+        if sharded:
+            assert torch.equal(loc, cph.home_rank(torch.arange(e), w, u) == r)
+    cache = torch.zeros(2, len(perm), bs, hkv, dh, dtype=dtype)
+    return cph.kv_store.PagedKVStore(cache, tables, lpos, present)
 
 
 def _rows_kv(plan, KL, rows):
@@ -261,6 +304,10 @@ def cases(world):
                              kw={"adaptive": {"threshold": 0.35},
                                  "ulysses": {"n_mb": 2},
                                  "passq": {"n_mb": 2}}), tol))
+    # vLLM paged layout (block_size = interleave = u)
+    out.append((dict(hq=8, hkv=2, dh=16, layers=1, dtype=torch.float32,
+                     seed=55 + world, u=16, n_reqs=6, store="paged",
+                     kw={"adaptive": {"threshold": 0.35}}), 2e-5))
     # interleave unit 128 (the design value) and single micro-batch
     out.append((dict(hq=8, hkv=2, dh=16, layers=1, dtype=torch.float32,
                      seed=77 + world, u=128, n_reqs=5,
