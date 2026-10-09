@@ -208,6 +208,11 @@ from vllm.v1.worker.gpu.eplb_utils import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+from vllm.v1.worker.hole_segments import (
+    HoleSegments,
+    build_hole_segments,
+    segment_common_attn_metadata,
+)
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
@@ -790,6 +795,9 @@ class GPUModelRunner(
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # holes/core: segment view of the step being prepared (None when no
+        # request of the step has holes).
+        self._hole_segments: HoleSegments | None = None
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -1955,6 +1963,23 @@ class GPUModelRunner(
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
 
+        # holes/core: requests with holes compute hole pieces below their
+        # frontier plus a tail; rewrite their positions and build the
+        # per-segment view used for the attention metadata.
+        hole_segments: HoleSegments | None = None
+        if scheduler_output.scheduled_hole_ranges:
+            assert not self.uses_mrope and self.uses_xdrope_dim == 0, (
+                "holes are not supported with M-RoPE / XD-RoPE"
+            )
+            hole_segments = build_hole_segments(
+                self.input_batch.req_ids,
+                scheduler_output.scheduled_hole_ranges,
+                num_scheduled_tokens,
+                self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                positions_np,
+            )
+        self._hole_segments = hole_segments
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2044,6 +2069,12 @@ class GPUModelRunner(
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        if hole_segments is not None:
+            # A request's sequence ends at its tail's end; hole pieces lie
+            # below the frontier.
+            self.optimistic_seq_lens_cpu[:num_reqs] -= torch.from_numpy(
+                hole_segments.req_hole_tokens
+            )
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
@@ -2140,6 +2171,15 @@ class GPUModelRunner(
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
+        if hole_segments is not None:
+            # holes/core: explicit positions (pieces, then tail) and
+            # request-level seq_lens ending at the tail.
+            self.positions[:total_num_scheduled_tokens].copy_(
+                torch.from_numpy(positions_np).to(torch.int64), non_blocking=False
+            )
+            self.seq_lens[:num_reqs] -= torch.from_numpy(
+                hole_segments.req_hole_tokens
+            ).to(self.device)
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
@@ -2260,6 +2300,7 @@ class GPUModelRunner(
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        hole_segments: HoleSegments | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """Returns:
         tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2412,6 +2453,11 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
         )
+        if hole_segments is not None:
+            # holes/core: one varlen entry per segment (KERNEL-ALGO (a)).
+            assert ubatch_slices is None and num_reqs_padded == num_reqs
+            assert len(kv_cache_groups) == 1 and self.dcp_world_size == 1
+            cm_base = segment_common_attn_metadata(cm_base, hole_segments, self.device)
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -3731,6 +3777,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        disable_full_cudagraph: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3766,7 +3813,9 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes={CUDAGraphMode.FULL}
+                if disable_full or disable_full_cudagraph
+                else None,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -4022,6 +4071,9 @@ class GPUModelRunner(
                 self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
             )
 
+            hole_segments = self._hole_segments
+            self._hole_segments = None
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4034,9 +4086,11 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=False,
+                disable_full_cudagraph=hole_segments is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-                allow_microbatching=self._allow_microbatching(
-                    num_reqs, num_scheduled_tokens_np
+                allow_microbatching=(
+                    hole_segments is None
+                    and self._allow_microbatching(num_reqs, num_scheduled_tokens_np)
                 ),
             )
 
@@ -4151,6 +4205,7 @@ class GPUModelRunner(
                     use_spec_decode=use_spec_decode,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     slot_mappings=slot_mappings_by_group,
+                    hole_segments=hole_segments,
                 )
             )
 

@@ -470,6 +470,12 @@ class CommonAttentionMetadata:
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
 
+    hole_segments: Any = None
+    """holes/core: when a request of the step has holes, every "request" of
+    this metadata is a segment (hole piece or tail); this is the
+    vllm.v1.worker.hole_segments.HoleSegments view mapping segments back to
+    requests (seg_req_idx) with their positions. None otherwise."""
+
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
 
