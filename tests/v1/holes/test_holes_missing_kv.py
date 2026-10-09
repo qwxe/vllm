@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """holes/cp: missing-KV ranges (hit-mask misses) from the scheduler to the
 CP_HOLES slot validity (CPU)."""
 

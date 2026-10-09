@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """holes/cp: per-scheme CP step budgets in the hole chunk planner (CPU)."""
 
 try:

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Context-parallel schemes for holed prefills (KERNEL-ALGO.md section 4).
 
 Every scheme is built once per step from the global `StepPlan` (identical on

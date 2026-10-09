@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-rank KV storage seen by the CP schemes.
 
 The schemes only need two operations on the local KV of one layer:

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Multi-GPU correctness check and per-scheme step time of the CP schemes.
 
 Run on the rented node (NCCL, one process per GPU):

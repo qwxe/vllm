@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Correctness + per-scheme step time of the CP_HOLES schemes on a multi-GPU
 # node (NCCL). Run from the vLLM fork root, inside the vLLM environment.
 #   benchmarks/cp_holes/run_server.sh [out.jsonl]
