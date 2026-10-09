@@ -155,6 +155,11 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_boundary_state_offloads: list[
             tuple[str, int, KVCacheBlock, int]
         ] = []
+        # holes/core: {req_id: indices of blocks allocated in place for a
+        # hole that are not cached yet}. A hole block is cached when its
+        # range is scheduled (see cache_hole_blocks), mirroring how the tail
+        # is cached at schedule time.
+        self.uncached_hole_blocks: dict[str, set[int]] = {}
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -413,6 +418,66 @@ class SingleTypeKVCacheManager(ABC):
         """Whether this manager's new blocks are zeroed by the worker."""
         return self._record_new_block_ids
 
+    def allocate_new_computed_blocks_with_holes(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+    ) -> int:
+        """holes/core: add a new request's cache hits, where null blocks mark
+        holes. Touches the hit blocks and allocates a fresh block in place of
+        every hole block, so the block table stays position ordered.
+
+        Returns the number of hole blocks allocated.
+        """
+        assert request_id not in self.num_cached_block
+        req_blocks = self.req_to_blocks[request_id]
+        assert len(req_blocks) == 0
+        hits = [blk for blk in new_computed_blocks if not blk.is_null]
+        hole_idx = [i for i, blk in enumerate(new_computed_blocks) if blk.is_null]
+        assert self.enable_caching
+        self.block_pool.touch(hits)
+        fresh = self.block_pool.get_new_blocks(len(hole_idx)) if hole_idx else []
+        req_blocks.extend(new_computed_blocks)
+        for i, blk in zip(hole_idx, fresh):
+            req_blocks[i] = blk
+        if self._record_new_block_ids:
+            self.new_block_ids.extend(b.block_id for b in fresh)
+        # Blocks up to the frontier count as "cached" for the stock
+        # cache_blocks() frontier; hole blocks are cached separately.
+        self.num_cached_block[request_id] = len(req_blocks)
+        if hole_idx:
+            self.uncached_hole_blocks[request_id] = set(hole_idx)
+        return len(hole_idx)
+
+    def cache_hole_blocks(self, request: Request, ranges: list[tuple[int, int]]) -> None:
+        """holes/core: cache the hole blocks fully covered by ``ranges``
+        (token ranges scheduled for computation in this step)."""
+        pending = self.uncached_hole_blocks.get(request.request_id)
+        if not pending:
+            return
+        bs = self.block_size
+        idx = sorted(
+            i for i in pending if any(s <= i * bs and (i + 1) * bs <= e for s, e in ranges)
+        )
+        blocks = self.req_to_blocks[request.request_id]
+        k = 0
+        while k < len(idx):
+            j = k
+            while j + 1 < len(idx) and idx[j + 1] == idx[j] + 1:
+                j += 1
+            self.block_pool.cache_full_blocks(
+                request=request,
+                blocks=blocks,
+                num_cached_blocks=idx[k],
+                num_full_blocks=idx[j] + 1,
+                block_size=bs,
+                kv_cache_group_id=self.kv_cache_group_id,
+            )
+            k = j + 1
+        pending.difference_update(idx)
+        if not pending:
+            del self.uncached_hole_blocks[request.request_id]
+
     def take_new_block_ids(self) -> list[int]:
         """Drain and return block IDs allocated since the last call."""
         ids = self.new_block_ids
@@ -576,6 +641,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self.uncached_hole_blocks.pop(request_id, None)
         return req_blocks
 
     def free(self, request_id: str) -> None:
@@ -826,6 +892,31 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         for computed in computed_blocks:
             del computed[num_blocks:]
         return computed_blocks, hit_length
+
+    @classmethod
+    def find_cache_hits_with_holes(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+    ) -> list[list[KVCacheBlock] | None]:
+        """holes/core: look up every full block of the first ``max_length``
+        tokens, continuing past misses (unlike find_longest_cache_hit). Block
+        hashes are chained over token ids, not over KV presence, so a block
+        after a miss is still found by its hash.
+
+        Returns one entry per block: the cached block of each group in
+        ``kv_cache_group_ids``, or None for a miss. Trailing misses are kept;
+        the caller trims them.
+        """
+        assert type(kv_cache_spec) is FullAttentionSpec
+        max_num_blocks = max_length // kv_cache_spec.block_size
+        return [
+            block_pool.get_cached_block(block_hash, kv_cache_group_ids)
+            for block_hash in itertools.islice(block_hashes, max_num_blocks)
+        ]
 
     def cache_blocks(
         self,
