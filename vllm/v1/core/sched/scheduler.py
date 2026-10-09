@@ -40,6 +40,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderDecoderCacheManager,
 )
 from vllm.v1.core.holes import (
+    cp_step_budget,
     get_hole_config,
     plan_step,
     range_tokens,
@@ -1108,6 +1109,15 @@ class Scheduler(SchedulerInterface):
         budget = token_budget
         if cfg.step_budget > 0:
             budget = min(budget, cfg.step_budget)
+        if cfg.cp_scheme:
+            # holes/cp: the CP scheme's per-request step budget (5.3).
+            d = cfg.cp_size or (
+                self.vllm_config.parallel_config.prefill_context_parallel_size
+            )
+            work = range_tokens(request.pending_hole_ranges) + max(
+                0, request.num_tokens - frontier
+            )
+            budget = min(budget, cp_step_budget(cfg, d, work, request.num_tokens))
         threshold = self.scheduler_config.long_prefill_token_threshold
         if threshold > 0:
             budget = min(budget, threshold)

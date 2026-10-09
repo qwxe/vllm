@@ -63,6 +63,29 @@ class HoleConfig:
     test_hooks: bool = False
     """Enable test-only helpers (e.g. Scheduler.holes_evict_token_range)."""
 
+    cp_scheme: str = ""
+    """Context-parallel scheme of the instance (holes/cp): "" (no CP budget),
+    "ulysses", "passq", "allgather", "ring" or "adaptive". Sets the
+    per-request step budget of a holed request (KERNEL-ALGO 5.3, see
+    `cp_step_budget`); `step_budget`, `long_prefill_token_threshold` and
+    max_num_batched_tokens still cap it."""
+
+    cp_size: int = 0
+    """CP degree d for the budget; 0 = prefill_context_parallel_size."""
+
+    cp_rank_tokens: int = 2048
+    """Tokens per rank per step (2048 = the profiled dense range)."""
+
+    cp_attn_tflops: float = 280.0
+    """Attention throughput F_attn per GPU (TFLOP/s) for the ring minimum."""
+
+    cp_link_gbps: float = 16.0
+    """CP link bandwidth (GB/s) for the ring minimum (from calibration)."""
+
+    cp_passq_ratio: float = 0.2
+    """adaptive: a request-step with computed / context below this runs
+    pass-Q (budget as pass-Q), otherwise the ring."""
+
     @staticmethod
     def from_dict(d: dict[str, Any] | None) -> "HoleConfig":
         if not d:
@@ -81,6 +104,46 @@ class HoleConfig:
         assert self.step_budget >= 0
         assert self.min_reuse_blocks >= 1
         assert self.min_mixed_tail >= 1
+        assert self.cp_scheme in CP_SCHEMES, self.cp_scheme
+        assert self.cp_size >= 0 and self.cp_rank_tokens > 0
+        assert self.cp_attn_tflops > 0 and self.cp_link_gbps > 0
+
+
+CP_SCHEMES = ("", "ulysses", "passq", "allgather", "ring", "adaptive")
+
+
+def cp_ring_min_tokens(cfg: HoleConfig) -> int:
+    """C_ring = F_attn / (4 BW_link) tokens per rank, rounded up to the
+    granule: below it the ring's KV transfer is not hidden by attention
+    (KERNEL-ALGO 4.2 / 5.3)."""
+    c = cfg.cp_attn_tflops * 1e12 / (4.0 * cfg.cp_link_gbps * 1e9)
+    g = cfg.chunk_granule
+    return int(-(-int(c) // g) * g)
+
+
+def cp_step_budget(cfg: HoleConfig, d: int, work: int | None = None,
+                   context: int | None = None) -> int:
+    """Per-request step budget (all CP ranks) for the instance's CP scheme
+    (KERNEL-ALGO 5.3); 0 = no CP budget.
+
+    ulysses / passq / allgather: d * cp_rank_tokens.
+    ring: d * max(cp_rank_tokens, C_ring).
+    adaptive: the ring's budget when work / context >= cp_passq_ratio (the
+    request-step would run the ring), else pass-Q's; `work` is the request's
+    remaining computed tokens (holes + tail) and `context` its length.
+    """
+    if not cfg.cp_scheme:
+        return 0
+    d = max(1, d)
+    base = d * cfg.cp_rank_tokens
+    ring = d * max(cfg.cp_rank_tokens, cp_ring_min_tokens(cfg))
+    if cfg.cp_scheme in ("ulysses", "passq", "allgather"):
+        return base
+    if cfg.cp_scheme == "ring":
+        return ring
+    if work is None or not context:
+        return base
+    return ring if work / context >= cfg.cp_passq_ratio else base
 
 
 def get_hole_config(vllm_config: Any) -> HoleConfig:
