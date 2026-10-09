@@ -639,6 +639,10 @@ class SingleTypeKVCacheManager(ABC):
         """
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
+        if self.block_pool.eviction_policy is not None:
+            # holes/rate: the request becomes the owner of its blocks.
+            self.block_pool.eviction_policy.on_request_free(request_id, req_blocks)
+
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
         self.uncached_hole_blocks.pop(request_id, None)
