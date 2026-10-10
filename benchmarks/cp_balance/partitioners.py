@@ -56,10 +56,9 @@ def _sim(method, segs, d, a=SIM_A, b=SIM_B):
 
 
 def c2e(segs, d, u=128):
-    import torch
     from vllm.v1.attention.cp_holes.plan import StepPlan, rows_c2e
-    plan = StepPlan(segments=[list(segs)], d=d, u=u)
-    return [r.numpy().astype(np.int64) for r in rows_c2e(plan)]
+    plan = StepPlan(segments=[list(segs)], d=d)
+    return [r.numpy().astype(np.int64) for r in rows_c2e(plan, cut_unit=u)]
 
 
 def snake(segs, d, per=4, a=SIM_A, b=SIM_B):

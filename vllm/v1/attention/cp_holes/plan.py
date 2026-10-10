@@ -211,13 +211,20 @@ def rows_of_reqs(plan: StepPlan, reqs: Sequence[int]) -> torch.Tensor:
     return torch.cat(parts) if parts else torch.empty(0, dtype=torch.int64)
 
 
-def rows_c2e(plan: StepPlan, reqs: Optional[Sequence[int]] = None
-             ) -> list[torch.Tensor]:
-    """Ring / all-gather rows: per-request c2e, cuts snapped to plan.u.
+def rows_c2e(plan: StepPlan, reqs: Optional[Sequence[int]] = None,
+             cut_unit: Optional[int] = None) -> list[torch.Tensor]:
+    """Ring / all-gather rows: per-request c2e, cuts snapped to `cut_unit`
+    tokens (default plan.u).
+
+    The cut unit is independent of the KV placement unit: no scheme needs a
+    rank's rows to be u-aligned. With u = 128, a step of fewer than 128 * d
+    tokens leaves ranks idle; 16-token cuts keep it balanced (BALANCE-4050.md,
+    section 4.3: eta at d = 8 on short tails .50 -> .87-.92).
 
     Returns out[rank] = global row indices (ascending).
     """
-    d, u = plan.d, plan.u
+    d = plan.d
+    u = plan.u if cut_unit is None else int(cut_unit)
     reqs = range(plan.num_reqs) if reqs is None else reqs
     per_rank = [[] for _ in range(d)]
     for i in reqs:
