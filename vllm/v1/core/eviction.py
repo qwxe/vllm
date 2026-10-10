@@ -114,6 +114,20 @@ class EvictionConfig:
     """Multiplies the params' time samples (tool gaps, decode durations) and
     the floor; for time-compressed experiments."""
 
+    position_cost: bool = True
+    """Ablation: False scores every chunk at the cost of chunk 0, so only the
+    owner's rate orders the groups."""
+
+    protect_queued: bool = True
+    """Ablation: False scores the chunks of an owner whose successor is
+    waiting (arrived, not through prefill) as idle instead of protected."""
+
+    order: str = "front"
+    """Tie order between the chunks of one owner: "front" (front first, which
+    leaves holes) or "tail" (tail first, as stock LRU: suffix misses only, no
+    holes). With ``position_cost=False`` and "tail" the policy is a hole-free,
+    request-ordered rate."""
+
     @staticmethod
     def from_dict(d: dict[str, Any] | None) -> "EvictionConfig":
         if not d:
@@ -133,6 +147,7 @@ class EvictionConfig:
         assert self.cost_b1 >= 0 and self.cost_b2 >= 0
         assert self.running_owner in ("protect", "decode")
         assert self.time_scale > 0
+        assert self.order in ("front", "tail")
         if self.policy == "rate":
             assert self.params is not None, "rate eviction needs params"
 
@@ -356,6 +371,8 @@ class RateEvictionPolicy:
 
     # ------------------------------------------------------------ scoring
     def chunk_cost(self, k: int) -> float:
+        if not self.cfg.position_cost:
+            k = 0
         c = self._cost_cache.get(k)
         if c is None:
             c = self._cost_cache[k] = chunk_recompute_s(
@@ -377,7 +394,8 @@ class RateEvictionPolicy:
         if nx is not None and not (nx.done is not None and nx.prefill_done is None):
             if nx.prefill_done is not None:
                 return "dead", 0.0
-            return "queued", PROTECTED_RATE
+            if self.cfg.protect_queued:
+                return "queued", PROTECTED_RATE
         q = 1.0 - prm.p_end
         if r.done is None:
             if self.cfg.running_owner == "protect":
@@ -397,7 +415,7 @@ class RateEvictionPolicy:
         self._seq += 1
         return (
             sr[1] * self.chunk_cost(k),
-            k,
+            k if self.cfg.order == "front" else -k,
             self._seq,
             key,
             self._epoch,
