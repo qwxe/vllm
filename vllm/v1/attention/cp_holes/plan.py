@@ -90,8 +90,18 @@ class StepPlan:
         return (~self.computed_mask(i)).nonzero(as_tuple=True)[0]
 
     def resident_homed(self, i: int, rank: int) -> torch.Tensor:
-        p = self.resident_positions(i)
-        return p[home_rank(p, self.d, self.u) == rank]
+        # Split the resident positions by home rank once per request; the
+        # ring constructor asks for every (request, rank) pair.
+        cache = self.__dict__.setdefault("_res_homed", {})
+        parts = cache.get(i)
+        if parts is None:
+            p = self.resident_positions(i)
+            h = home_rank(p, self.d, self.u)
+            order = torch.argsort(h, stable=True)
+            counts = torch.bincount(h, minlength=self.d).tolist()
+            parts = list(torch.split(p[order], counts))
+            cache[i] = parts
+        return parts[rank]
 
     def num_resident_homed(self, rank: int,
                            reqs: Optional[Sequence[int]] = None) -> int:
@@ -155,10 +165,13 @@ def _two_ended(cost: torch.Tensor, d: int, iters: int = 14
     ranges [a, b).
     """
     nu = int(cost.numel())
-    pre = torch.cat([torch.zeros(1, dtype=cost.dtype), cost.cumsum(0)])
+    # Host floats: the bisection below evaluates seg() thousands of times,
+    # and a torch scalar index costs microseconds each.
+    pre = torch.cat([torch.zeros(1, dtype=cost.dtype),
+                     cost.cumsum(0)]).tolist()
 
     def seg(a, b):
-        return float(pre[b] - pre[a]) if b > a else 0.0
+        return pre[b] - pre[a] if b > a else 0.0
 
     def fill(T):
         out, lo, hi = [], 0, nu
