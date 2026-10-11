@@ -22,7 +22,9 @@ TRITON_MLA with the prefill (`forward_mha`) replaced by MSA (MLA-MSA.md):
 Select with `--attention-backend MSA_MLA`. Env knobs: MSA_MODE (a | b | c | bc |
 auto, as for MSA), MSA_EPS, MSA_C, MSA_MLA_PATH (auto | compute | absorb),
 MSA_MLA_ABSORB_MAX (default 128 tokens per request-step, from the RTX 4050 bench), MSA_MLA_DECODE (triton |
-msa), MSA_MLA_WORKSPACE (context tokens per pass; tests).
+msa), MSA_MLA_WORKSPACE (context tokens per pass; tests), MSA_MLA_GROUP_ALIASED=1
+(profiler only: entries whose block tables start with the same block are the
+segments of one request, as in the profiler's aliased segmented shots).
 The up-projected context is bounded by vLLM's MLA prefill workspace
 (`chunked_prefill_workspace_size`); a longer context runs in several passes
 merged by LSE. Not supported: fp8 KV cache, DCP.
@@ -76,12 +78,15 @@ class MsaMLAPrefillMetadata(MLACommonPrefillMetadata):
     stats: dict = field(default_factory=dict)
 
 
-def mla_prefill_groups(cm, num_decodes: int):
+def mla_prefill_groups(cm, num_decodes: int, group_aliased: bool = False):
     """Prefill segments grouped by request.
 
     Returns (groups, num_prefill_rows): groups is a list of
-    (segment index of the request's first segment, E, [(row, n, pos_start)]),
-    rows relative to the first prefill token.
+    (varlen entry whose block-table row covers the group's context, E,
+    [(row, n, pos_start)]), rows relative to the first prefill token.
+    Requests come from `hole_segments` (holes/core), else every entry is its
+    own request; with `group_aliased` entries whose block tables start with the
+    same block are one request (the profiler's aliased segmented shots).
     """
     n = cm.num_reqs
     qsl = cm.query_start_loc_cpu[: n + 1].numpy().astype(np.int64)
@@ -90,7 +95,12 @@ def mla_prefill_groups(cm, num_decodes: int):
     else:  # H<>D sync; the GPU model runner always passes the CPU copy
         seq_lens = cm.seq_lens[:n].cpu().numpy().astype(np.int64)
     hs = getattr(cm, "hole_segments", None)
-    req = hs.seg_req_idx.astype(np.int64) if hs is not None else np.arange(n)
+    if hs is not None:
+        req = hs.seg_req_idx.astype(np.int64)
+    elif group_aliased:  # H<>D sync, profiling only
+        req = cm.block_table_tensor[:n, 0].cpu().numpy().astype(np.int64)
+    else:
+        req = np.arange(n)
     base = qsl[num_decodes]
     order: dict[int, list] = {}
     for i in range(num_decodes, n):
@@ -98,7 +108,8 @@ def mla_prefill_groups(cm, num_decodes: int):
         if q <= 0:
             continue
         g = order.setdefault(int(req[i]), [i, 0, []])
-        g[1] = max(g[1], int(seq_lens[i]))
+        if int(seq_lens[i]) > g[1]:
+            g[0], g[1] = i, int(seq_lens[i])
         g[2].append((int(qsl[i] - base), q, int(seq_lens[i]) - q))
     return [tuple(v) for v in order.values()], int(qsl[n] - base)
 
@@ -112,6 +123,7 @@ class MsaMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         self.path = os.environ.get("MSA_MLA_PATH", "auto")
         assert self.path in ("auto", COMPUTE, ABSORB), self.path
         self.absorb_max = int(os.environ.get("MSA_MLA_ABSORB_MAX", "128"))
+        self.group_aliased = os.environ.get("MSA_MLA_GROUP_ALIASED", "0") == "1"
         # decode: TRITON_MLA's kernel (default) or MSA's absorbed path ("msa";
         # forced for fp32, which the stock decode kernel cannot run on SM 8.x)
         dflt = "msa" if self.model_config.dtype == torch.float32 else "triton"
@@ -138,7 +150,7 @@ class MsaMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
                 c=self.c, num_rows=int(qsl[-1]), elem_size=self.elem_size)
         if md.prefill is None:
             return md
-        groups, n_rows = mla_prefill_groups(cm, md.num_decodes)
+        groups, n_rows = mla_prefill_groups(cm, md.num_decodes, self.group_aliased)
         comp, absb = [], []
         for g in groups:
             m = sum(n for _, n, _ in g[2])

@@ -159,6 +159,11 @@ def main():
         rec = dict(layout=name, E=E, m=m, n_seg=int(seg.num_segments))
         outs, times, host = {}, {k: [] for k in backends}, {}
         variants = list(backends) + ["MSA_MLA:absorb", "MSA_MLA:compute"]
+        if "--alias" in sys.argv and holes:
+            # the profiler's view: segments as separate requests with aliased
+            # block tables, no hole_segments
+            variants += ["MSA_MLA:alias", "MSA_MLA:alias-nogroup"]
+            cm_alias = cm.replace(hole_segments=None)
         mds = {}
         for k in variants:
             bk = "MSA_MLA" if k.startswith("MSA_MLA") else k
@@ -167,10 +172,15 @@ def main():
                 b.path = "absorb"
             elif k == "MSA_MLA:compute":
                 b.path = "compute"
+            elif k.startswith("MSA_MLA:alias"):
+                b.path = "auto"
+                b.group_aliased = k == "MSA_MLA:alias"
+            if bk == "MSA_MLA" and not k.startswith("MSA_MLA:alias"):
+                b.group_aliased = False
             elif bk == "MSA_MLA":
                 b.path = "auto"
             t0 = time.perf_counter()
-            mds[k] = b.build(0, cm)
+            mds[k] = b.build(0, cm_alias if k.startswith("MSA_MLA:alias") else cm)
             torch.cuda.synchronize()
             host[k] = (time.perf_counter() - t0) * 1e3
             times.setdefault(k, [])
@@ -208,7 +218,10 @@ def main():
         print(f"{name:45s} m={m:5d} seg={rec['n_seg']:2d} stock={st['TRITON_MLA']:10.0f} "
               f"msa={st['MSA_MLA']:10.0f} absorb={st.get('MSA_MLA:absorb', float('nan')):10.0f} "
               f"compute={st.get('MSA_MLA:compute', float('nan')):10.0f} "
-              f"x={st['TRITON_MLA'] / st['MSA_MLA']:.2f} err={rec.get('err')}", flush=True)
+              f"x={st['TRITON_MLA'] / st['MSA_MLA']:.2f} err={rec.get('err')}"
+              + (f" alias={st.get('MSA_MLA:alias'):.0f} alias_nogroup="
+                 f"{st.get('MSA_MLA:alias-nogroup'):.0f}" if 'MSA_MLA:alias' in st else ""),
+              flush=True)
         fout.write(json.dumps(rec) + "\n")
         fout.flush()
         del cache, mds, outs
