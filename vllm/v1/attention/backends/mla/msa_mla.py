@@ -21,7 +21,7 @@ TRITON_MLA with the prefill (`forward_mha`) replaced by MSA (MLA-MSA.md):
 
 Select with `--attention-backend MSA_MLA`. Env knobs: MSA_MODE (a | b | c | bc |
 auto, as for MSA), MSA_EPS, MSA_C, MSA_MLA_PATH (auto | compute | absorb),
-MSA_MLA_ABSORB_MAX (default 16 tokens per request-step), MSA_MLA_DECODE (triton |
+MSA_MLA_ABSORB_MAX (default 128 tokens per request-step, from the RTX 4050 bench), MSA_MLA_DECODE (triton |
 msa), MSA_MLA_WORKSPACE (context tokens per pass; tests).
 The up-projected context is bounded by vLLM's MLA prefill workspace
 (`chunked_prefill_workspace_size`); a longer context runs in several passes
@@ -111,7 +111,7 @@ class MsaMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         self.c = float(os.environ.get("MSA_C", "2.0"))
         self.path = os.environ.get("MSA_MLA_PATH", "auto")
         assert self.path in ("auto", COMPUTE, ABSORB), self.path
-        self.absorb_max = int(os.environ.get("MSA_MLA_ABSORB_MAX", "16"))
+        self.absorb_max = int(os.environ.get("MSA_MLA_ABSORB_MAX", "128"))
         # decode: TRITON_MLA's kernel (default) or MSA's absorbed path ("msa";
         # forced for fp32, which the stock decode kernel cannot run on SM 8.x)
         dflt = "msa" if self.model_config.dtype == torch.float32 else "triton"

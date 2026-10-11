@@ -41,7 +41,7 @@ def mla_launch_config(path: str, m_rows: int, dk: int, dv: int, elem_size: int =
         return 32, (4 if m_rows <= 64 else 8), 1
     if m_rows <= 64:
         return 64, 4, 2
-    return 32, 8, 2
+    return 64, 8, 2
 
 
 def _bq_for(max_seg: int, g_pad: int, rows_per_tile: int) -> int:
@@ -77,7 +77,7 @@ def plan_msa_mla(
         dk, dv = dk or 576, dv or 512
     else:
         hkv, g = num_heads, 1
-        rows_per_tile = rows_per_tile or 64
+        rows_per_tile = rows_per_tile or 128
         dk, dv = dk or 192, dv or 128
     g_pad = _next_pow2(g)
     max_seg = int(seg[:, 2].max()) if seg.shape[0] else 1
@@ -98,7 +98,7 @@ def plan_msa_mla_rows(qpos, qreq, kv_lens, path: str, num_heads: int, *,
     if path == ABSORB:
         hkv, g, rpt, dk, dv = 1, num_heads, rows_per_tile or 16, 576, 512
     else:
-        hkv, g, rpt, dk, dv = num_heads, 1, rows_per_tile or 64, 192, 128
+        hkv, g, rpt, dk, dv = num_heads, 1, rows_per_tile or 128, 192, 128
     bn, nw, ns = mla_launch_config(path, rpt, dk, dv, elem_size)
     return plan_msa_rows(qpos, qreq, kv_lens, hkv, g, block_size=block_size,
                          kblk_pos=kblk_pos, key_pos=key_pos, mode=mode, num_sms=num_sms,
