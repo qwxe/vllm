@@ -20,6 +20,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    MLAAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
 )
@@ -384,7 +385,9 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             and not use_eagle
             and dcp_world_size == 1
             and pcp_world_size == 1
-            and type(self.kv_cache_spec) is FullAttentionSpec
+            # MLA's spec is full attention with a latent page layout; hole
+            # lookup and allocation are block-granular and layout-agnostic.
+            and type(self.kv_cache_spec) in (FullAttentionSpec, MLAAttentionSpec)
             and type(self.single_type_managers[0]) is FullAttentionManager
         )
 

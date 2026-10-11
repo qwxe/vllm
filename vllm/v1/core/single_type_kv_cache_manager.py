@@ -554,7 +554,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         ``kv_cache_group_ids``, or None for a miss. Trailing misses are kept;
         the caller trims them.
         """
-        assert type(kv_cache_spec) is FullAttentionSpec
+        assert isinstance(kv_cache_spec, FullAttentionSpec)  # incl. MLA
         max_num_blocks = max_length // kv_cache_spec.block_size
         return [
             block_pool.get_cached_block(block_hash, kv_cache_group_ids)

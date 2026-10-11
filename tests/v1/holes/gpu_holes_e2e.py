@@ -36,12 +36,22 @@ def main():
 
     print("vllm from", vllm.__file__, flush=True)
     kw = {}
+    if os.environ.get("HOLES_MAX_LEN"):
+        kw["max_model_len"] = int(os.environ["HOLES_MAX_LEN"])
+    if os.environ.get("HOLES_HF_OVERRIDES"):
+        import json
+
+        kw["hf_overrides"] = json.loads(os.environ["HOLES_HF_OVERRIDES"])
+    if os.environ.get("HOLES_CUSTOM_OPS"):
+        # e.g. "-rotary_embedding": DeepSeek's rope otherwise JIT-compiles a
+        # FlashInfer kernel, which needs nvcc
+        kw["compilation_config"] = {"custom_ops": os.environ["HOLES_CUSTOM_OPS"].split(",")}
     if args.backend:
         kw["attention_backend"] = args.backend
     llm = LLM(
         MODEL,
         dtype=args.dtype,
-        max_model_len=8192,
+        **({"max_model_len": 8192} if "max_model_len" not in kw else {}),
         max_num_batched_tokens=2048,
         max_num_seqs=8,
         gpu_memory_utilization=args.gpu_util,
@@ -76,6 +86,9 @@ def main():
     for k in range(400):
         paras.append(f"Section {k}. " + zen.splitlines()[2 + k % 19] + f" (note {k * 7 % 13})\n")
     text_ids = tok.encode("".join(paras))
+    cap = int(os.environ.get("HOLES_VOCAB_CAP", "0"))
+    if cap:  # truncated-vocab model slices: keep in-vocabulary ids only
+        text_ids = [t for t in text_ids if t < cap]
 
     def prompt(n, seed):
         off = (seed * 977) % (len(text_ids) - n - 1)

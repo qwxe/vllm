@@ -28,7 +28,7 @@ COMPUTE = "compute"
 ABSORB = "absorb"
 
 
-def mla_launch_config(path: str, m_rows: int, dk: int, dv: int):
+def mla_launch_config(path: str, m_rows: int, dk: int, dv: int, elem_size: int = 2):
     """(bn, num_warps, num_stages) for the MLA kernel variant.
 
     Shared memory per stage is (dk + dv) * BN * 2 bytes for the compute path and
@@ -36,7 +36,9 @@ def mla_launch_config(path: str, m_rows: int, dk: int, dv: int):
     100 KB per CTA, Hopper 228 KB. Tuned on the RTX 4050 (MLA-MSA.md section 6).
     """
     if path == ABSORB:
-        return 32, 4, 2
+        return (32, 4, 2) if elem_size <= 2 else (16, 4, 2)
+    if elem_size > 2:
+        return 32, (4 if m_rows <= 64 else 8), 1
     if m_rows <= 64:
         return 64, 4, 2
     return 32, 8, 2
@@ -65,6 +67,7 @@ def plan_msa_mla(
     c: float = 2.0,
     dk: int | None = None,
     dv: int | None = None,
+    elem_size: int = 2,
 ) -> MsaPlan:
     """Plan an MLA launch from segments (req, row_start, n_rows, pos_start)."""
     seg = np.asarray(segments, dtype=np.int64).reshape(-1, 4)
@@ -79,7 +82,7 @@ def plan_msa_mla(
     g_pad = _next_pow2(g)
     max_seg = int(seg[:, 2].max()) if seg.shape[0] else 1
     m_rows = _bq_for(max_seg, g_pad, rows_per_tile) * g_pad
-    bn, nw, ns = mla_launch_config(path, m_rows, dk, dv)
+    bn, nw, ns = mla_launch_config(path, m_rows, dk, dv, elem_size)
     return plan_msa(seg, kv_lens, hkv, g, block_size=block_size, kblk_pos=kblk_pos,
                     mode=mode, num_sms=num_sms, device=device, rows_per_tile=rows_per_tile,
                     bn=bn, num_warps=nw, num_stages=ns, eps=eps, c=c, qpos=qpos,
@@ -90,13 +93,13 @@ def plan_msa_mla_rows(qpos, qreq, kv_lens, path: str, num_heads: int, *,
                       block_size: int = 16, kblk_pos=None, key_pos=None,
                       mode: str = "auto", num_sms: int | None = None, device="cuda",
                       rows_per_tile: int | None = None, qpos_dev=None,
-                      eps: float = 0.05, c: float = 2.0) -> MsaPlan:
+                      eps: float = 0.05, c: float = 2.0, elem_size: int = 2) -> MsaPlan:
     """Per-row variant (CP callers): rows in any order, any positions."""
     if path == ABSORB:
         hkv, g, rpt, dk, dv = 1, num_heads, rows_per_tile or 16, 576, 512
     else:
         hkv, g, rpt, dk, dv = num_heads, 1, rows_per_tile or 64, 192, 128
-    bn, nw, ns = mla_launch_config(path, rpt, dk, dv)
+    bn, nw, ns = mla_launch_config(path, rpt, dk, dv, elem_size)
     return plan_msa_rows(qpos, qreq, kv_lens, hkv, g, block_size=block_size,
                          kblk_pos=kblk_pos, key_pos=key_pos, mode=mode, num_sms=num_sms,
                          device=device, rows_per_tile=rpt, bn=bn, num_warps=nw,
@@ -228,20 +231,32 @@ def context_index(bt_rows: torch.Tensor, starts, lens, cache_block_size: int,
     return src, torch.from_numpy(dbt).to(dev, non_blocking=True), lens, kbp
 
 
-def mla_reference(q_nope, q_pe, k_nope, k_pe, v, qpos, qreq, kpos, kreq, scale):
+def mla_reference(q_nope, q_pe, k_nope, k_pe, v, qpos, qreq, kpos, kreq, scale,
+                  row_chunk: int = 256):
     """Dense fp32 reference over explicit keys (MHA form).
 
     q_nope [rows, H, P], q_pe [rows, H, R], k_nope [n, H, P], k_pe [n, R],
     v [n, H, V], positions / request ids as int tensors. Mask: same request and
     kpos <= qpos. Returns (O [rows, H, V] fp32, LSE [rows, H] fp32, -inf = empty).
+    Runs per request and per chunk of query rows to bound memory.
     """
-    qf = torch.cat([q_nope, q_pe], -1).float()
-    kf = torch.cat([k_nope, k_pe[:, None, :].expand(-1, k_nope.shape[1], -1)], -1).float()
-    s = torch.einsum("qhd,khd->hqk", qf, kf) * scale
-    allowed = (kreq[None, :] == qreq[:, None]) & (kpos[None, :] <= qpos[:, None])
-    s = s.masked_fill(~allowed[None], float("-inf"))
-    lse = torch.logsumexp(s, -1)
-    p = torch.exp(s - torch.where(torch.isinf(lse), 0.0, lse)[..., None])
-    p = torch.nan_to_num(p)
-    o = torch.einsum("hqk,khd->qhd", p, v.float())
-    return o, lse.transpose(0, 1).contiguous()
+    rows, H, _ = q_nope.shape
+    o = torch.zeros(rows, H, v.shape[-1], device=q_nope.device, dtype=torch.float32)
+    lse = torch.full((rows, H), float("-inf"), device=q_nope.device)
+    for r in torch.unique(qreq).tolist():
+        qi = (qreq == r).nonzero(as_tuple=True)[0]
+        ki = (kreq == r).nonzero(as_tuple=True)[0]
+        kf = torch.cat([k_nope[ki], k_pe[ki][:, None, :].expand(-1, H, -1)], -1).float()
+        vf = v[ki].float()
+        kp = kpos[ki]
+        for c in range(0, qi.numel(), row_chunk):
+            rr = qi[c:c + row_chunk]
+            qf = torch.cat([q_nope[rr], q_pe[rr]], -1).float()
+            s = torch.einsum("qhd,khd->hqk", qf, kf) * scale
+            allowed = kp[None, :] <= qpos[rr][:, None]
+            s = s.masked_fill(~allowed[None], float("-inf"))
+            ls = torch.logsumexp(s, -1)
+            p = torch.nan_to_num(torch.exp(s - torch.where(torch.isinf(ls), 0.0, ls)[..., None]))
+            o[rr] = torch.einsum("hqk,khd->qhd", p, vf)
+            lse[rr] = ls.transpose(0, 1)
+    return o, lse
