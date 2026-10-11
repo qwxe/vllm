@@ -77,7 +77,8 @@ def plan_msa_mla(
         dk, dv = dk or 576, dv or 512
     else:
         hkv, g = num_heads, 1
-        rows_per_tile = rows_per_tile or 128
+        # fp32 tiles of 128 rows exceed SM 8.x shared memory
+        rows_per_tile = rows_per_tile or (128 if elem_size <= 2 else 64)
         dk, dv = dk or 192, dv or 128
     g_pad = _next_pow2(g)
     max_seg = int(seg[:, 2].max()) if seg.shape[0] else 1
@@ -98,7 +99,8 @@ def plan_msa_mla_rows(qpos, qreq, kv_lens, path: str, num_heads: int, *,
     if path == ABSORB:
         hkv, g, rpt, dk, dv = 1, num_heads, rows_per_tile or 16, 576, 512
     else:
-        hkv, g, rpt, dk, dv = num_heads, 1, rows_per_tile or 128, 192, 128
+        hkv, g, dk, dv = num_heads, 1, 192, 128
+        rpt = rows_per_tile or (128 if elem_size <= 2 else 64)
     bn, nw, ns = mla_launch_config(path, rpt, dk, dv, elem_size)
     return plan_msa_rows(qpos, qreq, kv_lens, hkv, g, block_size=block_size,
                          kblk_pos=kblk_pos, key_pos=key_pos, mode=mode, num_sms=num_sms,
