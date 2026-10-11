@@ -27,8 +27,11 @@ per layer.
 
 `MlaLatentStore` is a reference store (dense per-request buffers indexed by
 position). In vLLM the store is the rank's paged latent cache under PCP's
-interleaved slot mapping (KPOS_MODE 1 over interleaved blocks); see
-MLA-MSA.md section 4 for what is left to wire.
+interleaved slot mapping; the backend (`backends/mla/msa_mla_cp.py`, MSA_MLA_CP)
+runs the replicated-dense variant of this scheme with the helpers below:
+`cp_local_len` / `cp_local_pos` (the rank's local key layout), `return_partials`
+(a2a of (O, LSE) partials to the row owners + LSE merge), `reduce_replicated`
+(that, then an all-gather of the merged rows) and `allgather_merge` (decode).
 """
 
 from __future__ import annotations
@@ -42,7 +45,8 @@ import torch.distributed as dist
 from vllm.v1.attention.ops.msa.api_mla import (COMPUTE, msa_mla_attention,
                                                plan_msa_mla_rows)
 
-from .comm import all_to_all_bytes, pack_rows, row_bytes, unpack_rows, wait_all
+from .comm import (all_gather_bytes, all_to_all_bytes, pack_rows, row_bytes,
+                   unpack_rows, wait_all)
 from .local_attn import merge_attn_states
 from .plan import StepPlan, home_rank, rows_contiguous
 from .schemes import CPComm
@@ -131,10 +135,7 @@ class MlaPassQCP:
             block_size=PAGE, key_pos=self.key_pos, mode=mode, device=dev)
 
     def _comm_dev(self, t: torch.Tensor) -> torch.device:
-        g = self.comm.group
-        if g is not None and dist.get_backend(g) == "gloo":
-            return torch.device("cpu")
-        return t.device
+        return wire_device(self.comm, t)
 
     def forward(self, q: torch.Tensor, lat: torch.Tensor, store: MlaLatentStore,
                 up_proj: Callable[[torch.Tensor], torch.Tensor],
@@ -176,20 +177,100 @@ class MlaPassQCP:
                               kblk_pos=self.kpos_t, softmax_scale=scale,
                               out=o, lse=lse)
         # return partial (O, LSE) of every rank's rows to their owner
-        send, off = [], 0
-        for x in range(d):
-            n = self.cnt[x]
-            send.append(pack_rows([o[off:off + n], lse[off:off + n]]).reshape(-1).to(cd))
-            off += n
-        ro = row_bytes((H, V), dt) + row_bytes((H, ), torch.float32)
-        bufs, w = all_to_all_bytes(send, [self.cnt[me] * ro] * d, self.comm.group)
-        wait_all([w])
-        os_, ls_ = [], []
-        for b in bufs:
-            o_p, l_p = unpack_rows(b.to(q.device), [((H, V), dt), ((H, ), torch.float32)])
-            os_.append(o_p)
-            ls_.append(l_p)
-        return merge_attn_states(os_, ls_)[0].to(dt)
+        return return_partials(self.comm, self.cnt, o, lse, dt)
+
+
+def wire_device(comm: CPComm, t: torch.Tensor) -> torch.device:
+    """Device the collectives run on: the host for gloo (tests), else t's."""
+    g = comm.group
+    if g is not None and dist.get_backend(g) == "gloo":
+        return torch.device("cpu")
+    return t.device
+
+
+def cp_local_len(e, d: int, r: int, u: int):
+    """Keys of positions [0, e) that rank r holds under the interleave
+    (position p on rank (p // u) % d). Works on ints and numpy arrays."""
+    e = np.asarray(e, dtype=np.int64)
+    full = e // (u * d)
+    return full * u + np.clip(e - full * u * d - r * u, 0, u)
+
+
+def cp_local_pos(j, d: int, r: int, u: int):
+    """Absolute position of rank r's local key index j (vLLM's PCP slot
+    mapping lays a request's local keys out in this order: local slot j of the
+    request is block j // block_size, offset j % block_size)."""
+    j = np.asarray(j, dtype=np.int64)
+    return ((j // u) * d + r) * u + j % u
+
+
+def return_partials(comm: CPComm, cnt: Sequence[int], o: torch.Tensor,
+                    lse: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
+    """o [m, H, V], lse [m, H]: this rank's partial attention of all m rows of
+    the step, rows owned contiguously (rank x owns the next cnt[x] rows).
+    Sends every rank its rows (O in `dt`, LSE fp32), merges the d partials by
+    LSE and returns the merged O of the own rows in `dt`."""
+    d, me = comm.world, comm.rank
+    H, V = o.shape[1], o.shape[2]
+    if d == 1:
+        return o.to(dt)
+    cd = wire_device(comm, o)
+    send, off = [], 0
+    for x in range(d):
+        n = cnt[x]
+        send.append(pack_rows([o[off:off + n].to(dt),
+                               lse[off:off + n].float()]).reshape(-1).to(cd))
+        off += n
+    ro = row_bytes((H, V), dt) + row_bytes((H, ), torch.float32)
+    bufs, w = all_to_all_bytes(send, [cnt[me] * ro] * d, comm.group)
+    wait_all([w])
+    os_, ls_ = [], []
+    for b in bufs:
+        o_p, l_p = unpack_rows(b.to(o.device), [((H, V), dt), ((H, ), torch.float32)])
+        os_.append(o_p)
+        ls_.append(l_p)
+    return merge_attn_states(os_, ls_)[0].to(dt)
+
+
+def reduce_replicated(comm: CPComm, cnt: Sequence[int], o: torch.Tensor,
+                      lse: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
+    """Replicated-dense reduction of per-rank partials of all m rows: the
+    partials go to the row owners (`return_partials`), and the merged rows are
+    all-gathered so that every rank gets the merged O [m, H, V] (`dt`)."""
+    if comm.world == 1:
+        return o.to(dt)
+    own = return_partials(comm, cnt, o, lse, dt)
+    tail = tuple(o.shape[1:])
+    rb = row_bytes(tail, dt)
+    cd = wire_device(comm, o)
+    bufs, w = all_gather_bytes(pack_rows([own]).reshape(-1).to(cd),
+                               [c * rb for c in cnt], comm.group)
+    wait_all([w])
+    parts = [unpack_rows(b.to(o.device), [(tail, dt)])[0] for b in bufs]
+    return torch.cat(parts)
+
+
+def allgather_merge(comm: CPComm, o: torch.Tensor,
+                    lse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode under CP: every rank holds partials of the same rows (local keys
+    only); all-gather them and LSE-merge on every rank. Returns (O in o's
+    dtype, LSE fp32)."""
+    if comm.world == 1:
+        return o, lse.float()
+    tail = tuple(o.shape[1:])
+    ltail = tuple(lse.shape[1:])
+    cd = wire_device(comm, o)
+    nb = o.shape[0] * (row_bytes(tail, o.dtype) + row_bytes(ltail, torch.float32))
+    bufs, w = all_gather_bytes(pack_rows([o, lse.float()]).reshape(-1).to(cd),
+                               [nb] * comm.world, comm.group)
+    wait_all([w])
+    os_, ls_ = [], []
+    for b in bufs:
+        o_p, l_p = unpack_rows(b.to(o.device), [(tail, o.dtype), (ltail, torch.float32)])
+        os_.append(o_p)
+        ls_.append(l_p)
+    om, lm = merge_attn_states(os_, ls_)
+    return om.to(o.dtype), lm
 
 
 def homed_resident_positions(plan: StepPlan, i: int, rank: int) -> torch.Tensor:

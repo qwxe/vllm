@@ -48,6 +48,11 @@ def main():
         kw["compilation_config"] = {"custom_ops": os.environ["HOLES_CUSTOM_OPS"].split(",")}
     if args.backend:
         kw["attention_backend"] = args.backend
+    if os.environ.get("HOLES_EXTRA_KW"):
+        # e.g. CP: {"prefill_context_parallel_size": 2, "block_size": 128, ...}
+        import json
+
+        kw.update(json.loads(os.environ["HOLES_EXTRA_KW"]))
     llm = LLM(
         MODEL,
         dtype=args.dtype,
@@ -149,7 +154,8 @@ def main():
         base = run([p])[0]
         _, maxd2 = compare(ref, base, name + "/prefix_only")
         noise.append(maxd2)
-        bs = 16
+        # KV-manager block (block_size x PCP size under CP)
+        bs = int(os.environ.get("HOLES_KV_BLOCK", "16"))
         frontier = ((n - 1) // bs) * bs
         expect_prefill = sum(e - s for s, e in holes) + (n - frontier)
         prefill_tokens = computed - (len(got[0]) - 1)

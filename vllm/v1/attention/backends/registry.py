@@ -70,6 +70,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     )
     TRITON_MLA = "vllm.v1.attention.backends.mla.triton_mla.TritonMLABackend"
     MSA_MLA = "vllm.v1.attention.backends.mla.msa_mla.MsaMLABackend"
+    MSA_MLA_CP = "vllm.v1.attention.backends.mla.msa_mla_cp.MsaMLACPBackend"
     CUTLASS_MLA = "vllm.v1.attention.backends.mla.cutlass_mla.CutlassMLABackend"
     FLASHMLA = "vllm.v1.attention.backends.mla.flashmla.FlashMLABackend"
     FLASHMLA_SPARSE = (
