@@ -21,7 +21,8 @@ TRITON_MLA with the prefill (`forward_mha`) replaced by MSA (MLA-MSA.md):
 
 Select with `--attention-backend MSA_MLA`. Env knobs: MSA_MODE (a | b | c | bc |
 auto, as for MSA), MSA_EPS, MSA_C, MSA_MLA_PATH (auto | compute | absorb),
-MSA_MLA_ABSORB_MAX (default 16 tokens per request-step).
+MSA_MLA_ABSORB_MAX (default 16 tokens per request-step), MSA_MLA_DECODE (triton |
+msa), MSA_MLA_WORKSPACE (context tokens per pass; tests).
 The up-projected context is bounded by vLLM's MLA prefill workspace
 (`chunked_prefill_workspace_size`); a longer context runs in several passes
 merged by LSE. Not supported: fp8 KV cache, DCP.
@@ -161,7 +162,7 @@ class MsaMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
             Es = np.array([g[1] for g in comp], dtype=np.int64)
             rows_t = torch.tensor([g[0] for g in comp], dtype=torch.int64)
             bt_rows = bt.index_select(0, rows_t.to(bt.device, non_blocking=True))
-            W = self.chunked_prefill_workspace_size
+            W = int(os.environ.get("MSA_MLA_WORKSPACE", self.chunked_prefill_workspace_size))
             wg = max(16, (W // G) // 16 * 16)
             n_pass = int(-(-Es.max() // wg)) if Es.sum() > W else 1
             if n_pass == 1:
