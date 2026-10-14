@@ -1,0 +1,29 @@
+gpurun: waiting for the GPU lock (18:35:22)
+gpurun: GPU acquired (18:35:22): env PYTHONPATH=/home/asd/vllm-dev-wt/mla /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/mla/benchmarks/msa_mla/tune_msa_mla.py
+E=32768 segs=[(30720, 2048)].. m=2048: gather 0.47 ms, up-proj 7.42 ms
+   attn 27.83 ms  rows_per_tile=128 bn=64 warps=8 stages=2
+   attn 32.32 ms  rows_per_tile=128 bn=32 warps=8 stages=2
+   attn 32.61 ms  rows_per_tile=128 bn=32 warps=4 stages=2
+   attn 33.42 ms  rows_per_tile=128 bn=32 warps=8 stages=3
+   attn 35.00 ms  rows_per_tile=128 bn=32 warps=4 stages=3
+   attn 36.92 ms  rows_per_tile=128 bn=64 warps=8 stages=1
+   current default: 50.82 ms {'mode': 'auto', 'bq': 64, 'bn': 64, 'warps': 4, 'stages': 2, 'm_rows': 64, 'n_tiles': 32, 'n_items_unsplit': 512, 'n_items': 512, 'n_split_groups': 0, 'split_len': 406784, 'max_chain_keys': 32768, 'total_keys': 16269312, 'packed_tiles': 0, 'packed_pieces': 0}
+   FA2 (last segment alone, bottom-right causal, v padded): 32.55 ms
+E=16384 segs=[(0, 8192)].. m=8192: gather 0.23 ms, up-proj 2.61 ms
+   attn 15.00 ms  rows_per_tile=128 bn=64 warps=8 stages=2
+   attn 16.25 ms  rows_per_tile=128 bn=32 warps=8 stages=2
+   attn 16.73 ms  rows_per_tile=128 bn=128 warps=8 stages=1
+   attn 16.82 ms  rows_per_tile=128 bn=32 warps=8 stages=3
+   attn 16.83 ms  rows_per_tile=128 bn=32 warps=4 stages=2
+   attn 17.33 ms  rows_per_tile=128 bn=32 warps=4 stages=3
+   current default: 23.33 ms {'mode': 'auto', 'bq': 64, 'bn': 64, 'warps': 4, 'stages': 2, 'm_rows': 64, 'n_tiles': 128, 'n_items_unsplit': 2048, 'n_items': 2048, 'n_split_groups': 0, 'split_len': 211392, 'max_chain_keys': 8192, 'total_keys': 8454144, 'packed_tiles': 0, 'packed_pieces': 0}
+   FA2 (last segment alone, bottom-right causal, v padded): 16.24 ms
+E=32768 segs=[(16384, 16), (17284, 16)].. m=2304: gather 0.45 ms, up-proj 5.18 ms
+   attn 39.69 ms  rows_per_tile=128 bn=64 warps=8 stages=2
+   attn 44.14 ms  rows_per_tile=128 bn=32 warps=8 stages=2
+   attn 44.87 ms  rows_per_tile=128 bn=128 warps=8 stages=1
+   attn 44.95 ms  rows_per_tile=128 bn=32 warps=4 stages=2
+   attn 45.36 ms  rows_per_tile=64 bn=32 warps=4 stages=2
+   attn 45.64 ms  rows_per_tile=128 bn=32 warps=8 stages=3
+   current default: 57.62 ms {'mode': 'auto', 'bq': 64, 'bn': 64, 'warps': 4, 'stages': 2, 'm_rows': 64, 'n_tiles': 40, 'n_items_unsplit': 640, 'n_items': 640, 'n_split_groups': 0, 'split_len': 482304, 'max_chain_keys': 32768, 'total_keys': 19290112, 'packed_tiles': 8, 'packed_pieces': 16}
+   FA2 (last segment alone, bottom-right causal, v padded): 32.03 ms

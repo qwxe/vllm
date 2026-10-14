@@ -1,0 +1,24 @@
+PASS test_lookup_continues_past_miss
+PASS test_allocate_in_place_and_cache_ranges
+PASS test_disabled_is_stock
+PASS test_min_reuse_blocks
+PASS test_can_fit_counts_holes
+INFO 10-11 19:08:21 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:08:21 [model.py:1678] Using max model len 8192
+INFO 10-11 19:08:21 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 10-11 19:08:22 [vllm.py:790] Asynchronous scheduling is enabled.
+PASS test_scheduler_hole_then_tail
+INFO 10-11 19:08:22 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:08:22 [model.py:1678] Using max model len 8192
+PASS test_scheduler_big_hole_chunks_front_first
+INFO 10-11 19:08:22 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:08:22 [model.py:1678] Using max model len 8192
+INFO 10-11 19:08:22 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:08:22 [model.py:1678] Using max model len 8192
+PASS test_scheduler_no_hole_identical_to_stock
+INFO 10-11 19:08:22 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:08:22 [model.py:1678] Using max model len 8192
+PASS test_scheduler_preempt_clears_holes
+INFO 10-11 19:08:22 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:08:22 [model.py:1678] Using max model len 8192
+PASS test_scheduler_mask_connector

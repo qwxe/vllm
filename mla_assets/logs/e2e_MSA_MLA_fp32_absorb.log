@@ -1,0 +1,101 @@
+gpurun: waiting for the GPU lock (18:28:51)
+gpurun: GPU acquired (18:28:51): env PYTHONPATH=/home/asd/vllm-dev-wt/mla MSA_MLA_PATH=absorb HOLES_MODEL=/home/asd/vllm-dev-wt/mla_assets/dsv2lite-1L HOLES_VOCAB_CAP=16384 HOLES_CUSTOM_OPS=-rotary_embedding /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/mla/tests/v1/holes/gpu_holes_e2e.py --eager --dtype float32 --backend MSA_MLA --gpu-util 0.6
+vllm from /home/asd/vllm-dev-wt/mla/vllm/__init__.py
+INFO 10-11 18:28:57 [utils.py:233] non-default args: {'dtype': 'float32', 'max_model_len': 8192, 'enable_prefix_caching': True, 'gpu_memory_utilization': 0.6, 'max_num_batched_tokens': 2048, 'max_num_seqs': 8, 'disable_log_stats': True, 'enforce_eager': True, 'compilation_config': {'mode': None, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['-rotary_embedding'], 'splitting_ops': None, 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': None, 'compile_ranges_endpoints': None, 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': None, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': None, 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': None, 'pass_config': {}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': None, 'static_all_moe_layers': []}, 'attention_backend': 'MSA_MLA', 'additional_config': {'holes': {'enabled': True, 'test_hooks': True}}, 'model': '/home/asd/vllm-dev-wt/mla_assets/dsv2lite-1L'}
+WARNING 10-11 18:28:57 [arg_utils.py:1395] The global random seed is set to 0. Since VLLM_ENABLE_V1_MULTIPROCESSING is set to False, this may affect the random state of the Python process that launched vLLM.
+`rope_scaling`'s factor field must be a float >= 1, got 40
+`rope_scaling`'s beta_fast field must be a float, got 32
+`rope_scaling`'s beta_slow field must be a float, got 1
+INFO 10-11 18:28:57 [model.py:549] Resolved architecture: DeepseekV2ForCausalLM
+INFO 10-11 18:28:57 [model.py:2010] Upcasting torch.bfloat16 to torch.float32.
+INFO 10-11 18:28:57 [model.py:1678] Using max model len 8192
+INFO 10-11 18:28:57 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 10-11 18:28:57 [vllm.py:790] Asynchronous scheduling is enabled.
+WARNING 10-11 18:28:57 [vllm.py:848] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 10-11 18:28:57 [vllm.py:859] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 10-11 18:28:58 [vllm.py:1025] Cudagraph is disabled under eager mode
+INFO 10-11 18:28:58 [compilation.py:290] Enabled custom fusions: norm_quant, act_quant
+INFO 10-11 18:28:59 [core.py:105] Initializing a V1 LLM engine (v0.19.0) with config: model='/home/asd/vllm-dev-wt/mla_assets/dsv2lite-1L', speculative_config=None, tokenizer='/home/asd/vllm-dev-wt/mla_assets/dsv2lite-1L', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.float32, max_seq_len=8192, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=/home/asd/vllm-dev-wt/mla_assets/dsv2lite-1L, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['-rotary_embedding', 'all'], 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': [], 'compile_ranges_endpoints': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+WARNING 10-11 18:28:59 [interface.py:525] Using 'pin_memory=False' as WSL is detected. This may slow down the performance.
+INFO 10-11 18:28:59 [parallel_state.py:1400] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://172.17.151.136:59629 backend=nccl
+INFO 10-11 18:28:59 [parallel_state.py:1716] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+INFO 10-11 18:29:00 [gpu_model_runner.py:4826] Starting to load model /home/asd/vllm-dev-wt/mla_assets/dsv2lite-1L...
+INFO 10-11 18:29:01 [cuda.py:274] Using AttentionBackendEnum.MSA_MLA backend.
+INFO 10-11 18:29:01 [mla_attention.py:2137] Using FlashAttention prefill for MLA
+WARNING 10-11 18:29:01 [deepseek_v2.py:1272] DeepSeekV2: No DeepseekV2MoE layer found in model.layers.
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.72it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.71it/s]
+
+INFO 10-11 18:29:01 [default_loader.py:384] Loading weights took 0.29 seconds
+INFO 10-11 18:29:01 [gpu_model_runner.py:4911] Model loading took 0.59 GiB memory and 0.513666 seconds
+INFO 10-11 18:29:03 [gpu_worker.py:436] Available KV cache memory: 1.87 GiB
+INFO 10-11 18:29:03 [kv_cache_utils.py:1319] GPU KV cache size: 871,376 tokens
+INFO 10-11 18:29:03 [kv_cache_utils.py:1324] Maximum concurrency for 8,192 tokens per request: 106.37x
+INFO 10-11 18:29:03 [core.py:283] init engine (profile, create kv cache, warmup model) took 1.63 seconds
+The Zen of Python, by Tim Peters
+
+Beautiful is better than ugly.
+Explicit is better than implicit.
+Simple is better than complex.
+Complex is better than complicated.
+Flat is better than nested.
+Sparse is better than dense.
+Readability counts.
+Special cases aren't special enough to break the rules.
+Although practicality beats purity.
+Errors should never pass silently.
+Unless explicitly silenced.
+In the face of ambiguity, refuse the temptation to guess.
+There should be one-- and preferably only one --obvious way to do it.
+Although that way may not be obvious at first unless you're Dutch.
+Now is better than never.
+Although never is often better than *right* now.
+If the implementation is hard to explain, it's a bad idea.
+If the implementation is easy to explain, it may be a good idea.
+Namespaces are one honking great idea -- let's do more of those!
+INFO 10-11 18:29:04 [block_pool.py:510] Successfully reset prefix cache
+[mid_hole] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=1968
+[mid_hole/fullhit] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=2992
+[mid_hole/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0002 cached_tokens=512
+   evicted_blocks=64 hole_steps=[{'2-ac15cd06': [(512, 1536)]}] prefill_tokens=1032 expected=1032 full_steps=[2048, 952, 1, 1]
+INFO 10-11 18:29:04 [block_pool.py:510] Successfully reset prefix cache
+[front_hole] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0001 cached_tokens=2480
+[front_hole/fullhit] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0001 cached_tokens=2992
+[front_hole/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=0
+   evicted_blocks=32 hole_steps=[{'6-858f0001': [(0, 512)]}] prefill_tokens=520 expected=520 full_steps=[2048, 952, 1, 1]
+INFO 10-11 18:29:05 [block_pool.py:510] Successfully reset prefix cache
+[two_holes] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=2480
+[two_holes/fullhit] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=2992
+[two_holes/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0001 cached_tokens=256
+   evicted_blocks=32 hole_steps=[{'10-974b8fae': [(256, 512), (1024, 1280)]}] prefill_tokens=520 expected=520 full_steps=[2048, 952, 1, 1]
+INFO 10-11 18:29:05 [block_pool.py:510] Successfully reset prefix cache
+[big_hole_chunked] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=1440
+[big_hole_chunked/fullhit] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0004 cached_tokens=5984
+[big_hole_chunked/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=256
+   evicted_blocks=284 hole_steps=[{'14-86e7ff0b': [(256, 2304)]}, {'14-86e7ff0b': [(2304, 4352)]}, {'14-86e7ff0b': [(4352, 4800)]}] prefill_tokens=4560 expected=4560 full_steps=[2048, 2048, 1904, 1]
+INFO 10-11 18:29:07 [block_pool.py:510] Successfully reset prefix cache
+[tail_1tok] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=1536
+[tail_1tok/fullhit] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=2048
+[tail_1tok/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0004 cached_tokens=512
+   evicted_blocks=32 hole_steps=[{'18-8d585005': [(512, 1024)]}] prefill_tokens=513 expected=513 full_steps=[2048, 1, 1, 1]
+INFO 10-11 18:29:08 [block_pool.py:510] Successfully reset prefix cache
+INFO 10-11 18:29:08 [block_pool.py:510] Successfully reset prefix cache
+[batch_a] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=1696
+[batch_b] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=0
+[batch_c] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0001 cached_tokens=1184
+   batch hole steps: [{'25-91be4523': [(800, 1600)]}]
+
+SUMMARY name tokens_equal dlp_first(holes) dlp_first(prefix_only) prefill_ok
+stock noise max=0.0004 -> limit 0.0018; token equality required: True
+   ('mid_hole', True, 2.1457672119140625e-06, 0.0001556873321533203, True)
+   ('front_hole', True, 0.00013685226440429688, 0.0, True)
+   ('two_holes', True, 3.647804260253906e-05, 7.343292236328125e-05, True)
+   ('big_hole_chunked', True, 3.5762786865234375e-05, 0.0, True)
+   ('tail_1tok', True, 8.821487426757812e-06, 0.0004107952117919922, True)
+   ('batch_a', True, 0.0, 0.0, True)
+   ('batch_b', True, 1.71661376953125e-05, 0.0, True)
+   ('batch_c', True, 7.486343383789062e-05, 0.0, True)
+RESULT PASS
+elapsed 18.2s
+[rank0]:[W1011 18:29:09.363054355 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

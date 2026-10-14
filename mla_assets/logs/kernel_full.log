@@ -1,0 +1,6 @@
+gpurun: waiting for the GPU lock (18:39:16)
+gpurun: GPU acquired (18:39:16): env PYTHONPATH=/home/asd/vllm-dev-wt/mla /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/mla/tests/v1/attention/msa_mla/test_msa_mla_kernel.py
+worst compute: |dO|=7.492e-03 |dLSE|=2.462e-03
+worst compute_2pass: |dO|=5.622e-03 |dLSE|=1.826e-03
+worst absorb: |dO|=4.330e-03 |dLSE|=2.124e-03
+RESULT 295/295 PASS

@@ -1,0 +1,28 @@
+gpurun: waiting for the GPU lock (20:49:13)
+gpurun: GPU acquired (20:49:13): /home/asd/dsk-smoke/gpuguard.sh env PYTHONPATH=/home/asd/vllm-dev-wt/mla /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/mla/tests/v1/attention/cp_holes/test_mla_cp_model_gloo.py --world 1 --backend MSA_MLA --out ref_u16.pt
+gpuguard: waiting (free commit 5.67 GB, sim jobs 0) 20:49:14
+gpuguard: waiting (free commit 3.42 GB, sim jobs 0) 20:52:15
+gpuguard: waiting (free commit 2.24 GB, sim jobs 0) 20:55:15
+gpuguard: waiting (free commit 1.17 GB, sim jobs 6) 20:58:17
+gpuguard: waiting (free commit 1.26 GB, sim jobs 8) 21:01:18
+gpuguard: waiting (free commit 1.21 GB, sim jobs 8) 21:04:20
+gpuguard: waiting (free commit 0.87 GB, sim jobs 8) 21:07:21
+gpuguard: waiting (free commit 0.64 GB, sim jobs 8) 21:10:23
+gpuguard: waiting (free commit 1.06 GB, sim jobs 8) 21:13:24
+gpuguard: waiting (free commit 1.61 GB, sim jobs 1) 21:16:25
+gpuguard: waiting (free commit 1.27 GB, sim jobs 1) 21:19:26
+gpuguard: waiting (free commit 1.32 GB, sim jobs 0) 21:22:27
+gpuguard: waiting (free commit 1.17 GB, sim jobs 0) 21:25:29
+gpuguard: waiting (free commit 0.81 GB, sim jobs 0) 21:28:30
+gpuguard: waiting (free commit 0.81 GB, sim jobs 0) 21:31:31
+gpuguard: waiting (free commit 0.73 GB, sim jobs 0) 21:34:33
+gpuguard: waiting (free commit 0.78 GB, sim jobs 0) 21:37:34
+gpuguard: waiting (free commit  GB, sim jobs 0) 21:40:44
+gpuguard: waiting (free commit 0.56 GB, sim jobs 0) 21:43:46
+gpuguard: waiting (free commit 0.58 GB, sim jobs 0) 21:46:47
+gpuguard: waiting (free commit 0.63 GB, sim jobs 0) 21:49:48
+gpuguard: waiting (free commit 1.02 GB, sim jobs 0) 21:52:50
+gpuguard: waiting (free commit 1.39 GB, sim jobs 0) 21:55:51
+gpuguard: waiting (free commit 1.25 GB, sim jobs 0) 21:58:53
+gpuguard: waiting (free commit 0.97 GB, sim jobs 0) 22:01:54
+gpuguard: waiting (free commit 0.98 GB, sim jobs 0) 22:04:55

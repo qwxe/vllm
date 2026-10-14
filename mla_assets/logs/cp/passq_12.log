@@ -1,0 +1,14 @@
+gpurun: waiting for the GPU lock (20:43:40)
+gpurun: GPU acquired (20:43:40): /home/asd/dsk-smoke/gpuguard.sh env PYTHONPATH=/home/asd/vllm-dev-wt/mla /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/mla/tests/v1/attention/cp_holes/test_mla_cp_gloo.py --world 1 2 --steps 6
+gpuguard: go (free commit 8.05 GB, sim jobs 0) 20:43:41
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+world=1 u=128: 23/23 checks pass, worst |dO| 1.311e-02
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+world=1 u=16: 23/23 checks pass, worst |dO| 1.311e-02
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+world=2 u=128: 40/40 checks pass, worst |dO| 1.391e-02
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+world=2 u=16: 40/40 checks pass, worst |dO| 1.391e-02
+RESULT PASS

@@ -1,0 +1,13 @@
+PASS test_hits_to_holes
+PASS test_apply_min_reuse
+PASS test_subtract_ranges
+PASS test_plan_whole_fits
+PASS test_plan_front_first_and_granule_cut
+PASS test_plan_tail_cut_at_granule_from_segment_start
+PASS test_plan_no_small_remainder_overshoot
+PASS test_plan_no_small_remainder_cut_back
+PASS test_plan_short_hole_not_left_behind
+PASS test_plan_min_mixed_tail
+PASS test_plan_budget_below_granule
+PASS test_plan_configurable
+PASS test_plan_max_segments

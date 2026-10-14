@@ -1,0 +1,4 @@
+total 473.802734375 MiB 48 tensors
+0 48 lm_head.weight
+40 48 model.layers.1.mlp.shared_experts.up_proj.weight
+done

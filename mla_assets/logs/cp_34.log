@@ -1,0 +1,12 @@
+gpurun: waiting for the GPU lock (18:44:36)
+gpurun: GPU acquired (18:44:36): env PYTHONPATH=/home/asd/vllm-dev-wt/mla /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/mla/tests/v1/attention/cp_holes/test_mla_cp_gloo.py --world 3 4 --steps 8 --u 128
+[Gloo] Rank 0 is connected to 2 peer ranks. Expected number of connected peer ranks is : 2
+[Gloo] Rank 2 is connected to 2 peer ranks. Expected number of connected peer ranks is : 2
+[Gloo] Rank 1 is connected to 2 peer ranks. Expected number of connected peer ranks is : 2
+world=3 u=128: 84/84 checks pass, worst |dO| 1.491e-02
+[Gloo] Rank 0 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 1 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 2 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+[Gloo] Rank 3 is connected to 3 peer ranks. Expected number of connected peer ranks is : 3
+world=4 u=128: 112/112 checks pass, worst |dO| 1.511e-02
+RESULT PASS

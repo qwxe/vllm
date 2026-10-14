@@ -1,0 +1,115 @@
+gpurun: waiting for the GPU lock (18:48:01)
+gpurun: GPU acquired (18:48:01): env PYTHONPATH=/home/asd/vllm-dev-wt/mla HOLES_MODEL=/home/asd/vllm-dev-wt/mla_assets/dsv2lite-2L HOLES_VOCAB_CAP=16384 HOLES_CUSTOM_OPS=-rotary_embedding /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/mla/tests/v1/holes/gpu_holes_e2e.py --backend MSA_MLA --gpu-util 0.6
+vllm from /home/asd/vllm-dev-wt/mla/vllm/__init__.py
+INFO 10-11 18:48:11 [utils.py:233] non-default args: {'dtype': 'bfloat16', 'max_model_len': 8192, 'enable_prefix_caching': True, 'gpu_memory_utilization': 0.6, 'max_num_batched_tokens': 2048, 'max_num_seqs': 8, 'disable_log_stats': True, 'compilation_config': {'mode': None, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['-rotary_embedding'], 'splitting_ops': None, 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': None, 'compile_ranges_endpoints': None, 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': None, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': None, 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': None, 'pass_config': {}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': None, 'static_all_moe_layers': []}, 'attention_backend': 'MSA_MLA', 'additional_config': {'holes': {'enabled': True, 'test_hooks': True}}, 'model': '/home/asd/vllm-dev-wt/mla_assets/dsv2lite-2L'}
+WARNING 10-11 18:48:11 [arg_utils.py:1395] The global random seed is set to 0. Since VLLM_ENABLE_V1_MULTIPROCESSING is set to False, this may affect the random state of the Python process that launched vLLM.
+`rope_scaling`'s factor field must be a float >= 1, got 40
+`rope_scaling`'s beta_fast field must be a float, got 32
+`rope_scaling`'s beta_slow field must be a float, got 1
+INFO 10-11 18:48:11 [model.py:549] Resolved architecture: DeepseekV2ForCausalLM
+INFO 10-11 18:48:11 [model.py:1678] Using max model len 8192
+INFO 10-11 18:48:11 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 10-11 18:48:11 [vllm.py:790] Asynchronous scheduling is enabled.
+INFO 10-11 18:48:14 [core.py:105] Initializing a V1 LLM engine (v0.19.0) with config: model='/home/asd/vllm-dev-wt/mla_assets/dsv2lite-2L', speculative_config=None, tokenizer='/home/asd/vllm-dev-wt/mla_assets/dsv2lite-2L', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=8192, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=/home/asd/vllm-dev-wt/mla_assets/dsv2lite-2L, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['-rotary_embedding', 'none'], 'splitting_ops': ['vllm::unified_attention', 'vllm::unified_attention_with_output', 'vllm::unified_mla_attention', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': [], 'compile_ranges_endpoints': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 16, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+WARNING 10-11 18:48:14 [interface.py:525] Using 'pin_memory=False' as WSL is detected. This may slow down the performance.
+INFO 10-11 18:48:14 [parallel_state.py:1400] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://172.17.151.136:49927 backend=nccl
+INFO 10-11 18:48:14 [parallel_state.py:1716] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+INFO 10-11 18:48:15 [gpu_model_runner.py:4826] Starting to load model /home/asd/vllm-dev-wt/mla_assets/dsv2lite-2L...
+INFO 10-11 18:48:16 [cuda.py:274] Using AttentionBackendEnum.MSA_MLA backend.
+INFO 10-11 18:48:17 [mla_attention.py:2137] Using FlashAttention prefill for MLA
+INFO 10-11 18:48:18 [unquantized.py:186] Using TRITON backend for Unquantized MoE
+<frozen importlib._bootstrap_external>:1301: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1301: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:01<00:00,  1.65s/it]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:01<00:00,  1.65s/it]
+
+INFO 10-11 18:48:20 [default_loader.py:384] Loading weights took 1.70 seconds
+INFO 10-11 18:48:21 [gpu_model_runner.py:4911] Model loading took 0.48 GiB memory and 4.493353 seconds
+INFO 10-11 18:48:26 [backends.py:1051] Using cache directory: /home/asd/.cache/vllm/torch_compile_cache/0487f017c7/rank_0_0/backbone for vLLM's torch.compile
+INFO 10-11 18:48:26 [backends.py:1111] Dynamo bytecode transform time: 3.65 s
+[rank0]:W1011 18:48:28.488000 45291 torch/_inductor/utils.py:1679] Not enough SMs to use max_autotune_gemm mode
+INFO 10-11 18:48:40 [backends.py:372] Cache the graph of compile range (1, 2048) for later use
+INFO 10-11 18:48:47 [backends.py:390] Compiling a graph for compile range (1, 2048) takes 22.63 s
+INFO 10-11 18:48:47 [decorators.py:640] saved AOT compiled function to /home/asd/.cache/vllm/torch_compile_cache/torch_aot_compile/d7c68e16e4fe44b5222eb6914d4147cf2e7bb0788592473367b2cf7600c74bdc/rank_0_0/model
+INFO 10-11 18:48:47 [monitor.py:48] torch.compile took 26.63 s in total
+WARNING 10-11 18:48:50 [fused_moe.py:1090] Using default MoE config. Performance might be sub-optimal! Config file not found at /home/asd/vllm-dev-wt/mla/vllm/model_executor/layers/fused_moe/configs/E=8,N=1408,device_name=NVIDIA_GeForce_RTX_4050_Laptop_GPU.json
+INFO 10-11 18:48:53 [monitor.py:76] Initial profiling/warmup run took 5.80 s
+INFO 10-11 18:49:14 [kv_cache_utils.py:829] Overriding num_gpu_blocks=0 with num_gpu_blocks_override=16
+WARNING 10-11 18:49:14 [gpu_model_runner.py:6430] CUDAGraphMode.FULL_AND_PIECEWISE is not supported with MsaMLABackend backend (support: AttentionCGSupport.NEVER); setting cudagraph_mode=PIECEWISE because attention is compiled piecewise
+INFO 10-11 18:49:14 [gpu_model_runner.py:5967] Profiling CUDA graph memory: PIECEWISE=5 (largest=16)
+INFO 10-11 18:49:16 [gpu_model_runner.py:6046] Estimated CUDA graph memory: 0.05 GiB total
+INFO 10-11 18:49:17 [gpu_worker.py:436] Available KV cache memory: 2.54 GiB
+INFO 10-11 18:49:17 [gpu_worker.py:470] In v0.19, CUDA graph memory profiling will be enabled by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), which more accurately accounts for CUDA graph memory during KV cache allocation. To try it now, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase --gpu-memory-utilization from 0.6000 to 0.6081 to maintain the same effective KV cache size.
+INFO 10-11 18:49:17 [kv_cache_utils.py:1319] GPU KV cache size: 1,183,104 tokens
+INFO 10-11 18:49:17 [kv_cache_utils.py:1324] Maximum concurrency for 8,192 tokens per request: 144.42x
+Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   0%|          | 0/5 [00:00<?, ?it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  20%|██        | 1/5 [00:00<00:02,  1.97it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  60%|██████    | 3/5 [00:00<00:00,  4.23it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  80%|████████  | 4/5 [00:00<00:00,  4.63it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE): 100%|██████████| 5/5 [00:02<00:00,  1.55it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE): 100%|██████████| 5/5 [00:02<00:00,  2.02it/s]
+INFO 10-11 18:49:22 [gpu_model_runner.py:6137] Graph capturing finished in 4 secs, took 0.03 GiB
+INFO 10-11 18:49:22 [gpu_worker.py:597] CUDA graph pool memory: 0.03 GiB (actual), 0.05 GiB (estimated), difference: 0.02 GiB (78.6%).
+INFO 10-11 18:49:22 [core.py:283] init engine (profile, create kv cache, warmup model) took 60.06 seconds
+The Zen of Python, by Tim Peters
+
+Beautiful is better than ugly.
+Explicit is better than implicit.
+Simple is better than complex.
+Complex is better than complicated.
+Flat is better than nested.
+Sparse is better than dense.
+Readability counts.
+Special cases aren't special enough to break the rules.
+Although practicality beats purity.
+Errors should never pass silently.
+Unless explicitly silenced.
+In the face of ambiguity, refuse the temptation to guess.
+There should be one-- and preferably only one --obvious way to do it.
+Although that way may not be obvious at first unless you're Dutch.
+Now is better than never.
+Although never is often better than *right* now.
+If the implementation is hard to explain, it's a bad idea.
+If the implementation is easy to explain, it may be a good idea.
+Namespaces are one honking great idea -- let's do more of those!
+INFO 10-11 18:49:23 [block_pool.py:510] Successfully reset prefix cache
+[mid_hole] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0607 cached_tokens=1968
+[mid_hole/fullhit] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0617 cached_tokens=2992
+[mid_hole/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.1180 cached_tokens=512
+   evicted_blocks=64 hole_steps=[{'2-a97c279d': [(512, 1536)]}] prefill_tokens=1032 expected=1032 full_steps=[2048, 952, 1, 1]
+INFO 10-11 18:49:38 [block_pool.py:510] Successfully reset prefix cache
+[front_hole] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0014 cached_tokens=2480
+[front_hole/fullhit] tokens_equal=False agree_steps=3 max|dlogprob| first token top5=0.0590 cached_tokens=2992
+[front_hole/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=0
+   evicted_blocks=32 hole_steps=[{'6-abef2906': [(0, 512)]}] prefill_tokens=520 expected=520 full_steps=[2048, 952, 1, 1]
+INFO 10-11 18:49:42 [block_pool.py:510] Successfully reset prefix cache
+[two_holes] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0023 cached_tokens=2480
+[two_holes/fullhit] tokens_equal=False agree_steps=11 max|dlogprob| first token top5=0.0766 cached_tokens=2992
+[two_holes/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0801 cached_tokens=256
+   evicted_blocks=32 hole_steps=[{'10-aebadac2': [(256, 512), (1024, 1280)]}] prefill_tokens=520 expected=520 full_steps=[2048, 952, 1, 1]
+INFO 10-11 18:49:43 [block_pool.py:510] Successfully reset prefix cache
+[big_hole_chunked] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0641 cached_tokens=1440
+[big_hole_chunked/fullhit] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0643 cached_tokens=5984
+[big_hole_chunked/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0599 cached_tokens=256
+   evicted_blocks=284 hole_steps=[{'14-af61fadc': [(256, 2304)]}, {'14-af61fadc': [(2304, 4352)]}, {'14-af61fadc': [(4352, 4800)]}] prefill_tokens=4560 expected=4560 full_steps=[2048, 2048, 1904, 1]
+INFO 10-11 18:49:45 [block_pool.py:510] Successfully reset prefix cache
+[tail_1tok] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0607 cached_tokens=1536
+[tail_1tok/fullhit] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0000 cached_tokens=2048
+[tail_1tok/prefix_only] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.0628 cached_tokens=512
+   evicted_blocks=32 hole_steps=[{'18-a398be7e': [(512, 1024)]}] prefill_tokens=513 expected=513 full_steps=[2048, 1, 1, 1]
+INFO 10-11 18:49:46 [block_pool.py:510] Successfully reset prefix cache
+INFO 10-11 18:49:47 [block_pool.py:510] Successfully reset prefix cache
+[batch_a] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.1043 cached_tokens=1696
+[batch_b] tokens_equal=True agree_steps=24 max|dlogprob| first token top5=0.1113 cached_tokens=0
+[batch_c] tokens_equal=False agree_steps=23 max|dlogprob| first token top5=0.0938 cached_tokens=1184
+   batch hole steps: [{'25-b4496c7e': [(800, 1600)]}]
+
+SUMMARY name tokens_equal dlp_first(holes) dlp_first(prefix_only) prefill_ok
+stock noise max=0.1180 -> limit 0.2370; token equality required: False
+   ('mid_hole', True, 0.060714006423950195, 0.11799430847167969, True)
+   ('front_hole', True, 0.0013823509216308594, 0.0, True)
+   ('two_holes', True, 0.0022771358489990234, 0.08005249500274658, True)
+   ('big_hole_chunked', True, 0.0641484260559082, 0.05990123748779297, True)
+   ('tail_1tok', True, 0.06072640419006348, 0.06281375885009766, True)
+   ('batch_a', True, 0.10426187515258789, 0.0, True)
+   ('batch_b', True, 0.11132550239562988, 0.0, True)
+   ('batch_c', False, 0.09381484985351562, 0.0, True)
+RESULT PASS
+elapsed 107.0s
+[rank0]:[W1011 18:49:48.457348285 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

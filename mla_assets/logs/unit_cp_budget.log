@@ -1,0 +1,17 @@
+INFO 10-11 19:09:06 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:09:06 [model.py:1678] Using max model len 8192
+INFO 10-11 19:09:06 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 10-11 19:09:06 [vllm.py:790] Asynchronous scheduling is enabled.
+INFO 10-11 19:09:06 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:09:06 [model.py:1678] Using max model len 8192
+INFO 10-11 19:09:06 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 10-11 19:09:06 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:09:06 [model.py:1678] Using max model len 8192
+INFO 10-11 19:09:07 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:09:07 [model.py:1678] Using max model len 8192
+INFO 10-11 19:09:07 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=16384.
+INFO 10-11 19:09:07 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:09:07 [model.py:1678] Using max model len 8192
+INFO 10-11 19:09:07 [model.py:549] Resolved architecture: Qwen2ForCausalLM
+INFO 10-11 19:09:07 [model.py:1678] Using max model len 8192
+cp budget tests OK

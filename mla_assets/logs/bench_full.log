@@ -1,0 +1,53 @@
+gpurun: waiting for the GPU lock (18:37:15)
+gpurun: GPU acquired (18:37:15): env PYTHONPATH=/home/asd/vllm-dev-wt/mla /home/asd/LLMServingSim/.wt/vllm-venv/bin/python /home/asd/vllm-dev-wt/mla/benchmarks/msa_mla/bench_msa_mla.py /home/asd/vllm-dev-wt/mla_assets/dsv2lite-2L logs/bench_full.jsonl
+`rope_scaling`'s factor field must be a float >= 1, got 40
+`rope_scaling`'s beta_fast field must be a float, got 32
+`rope_scaling`'s beta_slow field must be a float, got 1
+INFO 10-11 18:37:19 [model.py:549] Resolved architecture: DeepseekV2ForCausalLM
+INFO 10-11 18:37:19 [model.py:1678] Using max model len 69632
+INFO 10-11 18:37:19 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=16384.
+INFO 10-11 18:37:19 [vllm.py:790] Asynchronous scheduling is enabled.
+INFO 10-11 18:37:19 [parallel_state.py:1400] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/tmpl74uksh0 backend=nccl
+INFO 10-11 18:37:19 [parallel_state.py:1716] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+INFO 10-11 18:37:20 [mla_attention.py:2137] Using FlashAttention prefill for MLA
+nohole tail2048 @16K                          m= 2048 seg= 1 stock=     20285 msa=     16324 absorb=    109970 compute=       nan x=1.24 err={'TRITON_MLA': 0.0009738504886627197, 'MSA_MLA': 0.0005941092967987061, 'MSA_MLA:absorb': 0.0007618963718414307}
+rate: hole 2048 @2K + tail2048 @16K           m= 4096 seg= 2 stock=     26034 msa=     19890 absorb=    139438 compute=       nan x=1.31 err={'TRITON_MLA': 0.0014415979385375977, 'MSA_MLA': 0.0009070038795471191, 'MSA_MLA:absorb': 0.0009525716304779053}
+1 x q16 deep + tail2048 @16K                  m= 2064 seg= 2 stock=     23466 msa=     16874 absorb=    111413 compute=       nan x=1.39 err={'TRITON_MLA': 0.0010050684213638306, 'MSA_MLA': 0.0006029307842254639, 'MSA_MLA:absorb': 0.0007970631122589111}
+4 x q16 deep + tail2048 @16K                  m= 2112 seg= 5 stock=     38796 msa=     19364 absorb=    120038 compute=       nan x=2.00 err={'TRITON_MLA': 0.001329854130744934, 'MSA_MLA': 0.000596269965171814, 'MSA_MLA:absorb': 0.0008427202701568604}
+16 x q16 deep + tail2048 @16K                 m= 2304 seg=17 stock=     93631 msa=     22314 absorb=    123556 compute=       nan x=4.20 err={'TRITON_MLA': 0.0014962255954742432, 'MSA_MLA': 0.0005949586629867554, 'MSA_MLA:absorb': 0.0007774680852890015}
+4 x q256 + tail2048 @16K                      m= 3072 seg= 5 stock=     34463 msa=     19442 absorb=    138557 compute=       nan x=1.77 err={'TRITON_MLA': 0.001323401927947998, 'MSA_MLA': 0.0010181963443756104, 'MSA_MLA:absorb': 0.0009306371212005615}
+16 x q256 + tail2048 @16K                     m= 6144 seg=17 stock=     84043 msa=     30646 absorb=       nan compute=       nan x=2.74 err={'TRITON_MLA': 0.0017936229705810547, 'MSA_MLA': 0.0009901374578475952}
+hole-only 1 x q16 deep @16K                   m=   16 seg= 1 stock=      3617 msa=       672 absorb=       605 compute=      2008 x=5.38 err={'TRITON_MLA': 0.0008962452411651611, 'MSA_MLA': 0.0006626993417739868, 'MSA_MLA:absorb': 0.0006626993417739868, 'MSA_MLA:compute': 0.0005461275577545166}
+hole-only 2 x q16 deep @16K                   m=   32 seg= 2 stock=      9299 msa=      3153 absorb=      1449 compute=      3142 x=2.95 err={'TRITON_MLA': 0.0008383989334106445, 'MSA_MLA': 0.0005576163530349731, 'MSA_MLA:absorb': 0.0006656646728515625, 'MSA_MLA:compute': 0.0005576163530349731}
+hole-only 4 x q16 deep @16K                   m=   64 seg= 4 stock=     19801 msa=      4901 absorb=      3426 compute=      4874 x=4.04 err={'TRITON_MLA': 0.000995337963104248, 'MSA_MLA': 0.0005316734313964844, 'MSA_MLA:absorb': 0.0007051080465316772, 'MSA_MLA:compute': 0.0005316734313964844}
+hole-only 8 x q16 deep @16K                   m=  128 seg= 8 stock=     40344 msa=      6509 absorb=      5919 compute=      6494 x=6.20 err={'TRITON_MLA': 0.0011004209518432617, 'MSA_MLA': 0.0005767196416854858, 'MSA_MLA:absorb': 0.0007243603467941284, 'MSA_MLA:compute': 0.0005767196416854858}
+hole-only 16 x q16 deep @16K                  m=  256 seg=16 stock=     75002 msa=      6762 absorb=     11145 compute=      6792 x=11.09 err={'TRITON_MLA': 0.001759171485900879, 'MSA_MLA': 0.0005668848752975464, 'MSA_MLA:absorb': 0.0006527453660964966, 'MSA_MLA:compute': 0.0005668848752975464}
+hole-only q2048 @8K of 16K                    m= 2048 seg= 1 stock=     12507 msa=      9967 absorb=     66469 compute=       nan x=1.25 err={'TRITON_MLA': 0.001010984182357788, 'MSA_MLA': 0.0006927251815795898, 'MSA_MLA:absorb': 0.0008108019828796387}
+nohole tail2048 @32K                          m= 2048 seg= 1 stock=     41708 msa=     33796 absorb=    258280 compute=       nan x=1.23 err={'TRITON_MLA': 0.0009827911853790283, 'MSA_MLA': 0.00055733323097229, 'MSA_MLA:absorb': 0.0007900595664978027}
+rate: hole 2048 @4K + tail2048 @32K           m= 4096 seg= 2 stock=     52427 msa=     39622 absorb=    301244 compute=       nan x=1.32 err={'TRITON_MLA': 0.0011102855205535889, 'MSA_MLA': 0.0006986707448959351, 'MSA_MLA:absorb': 0.0008924901485443115}
+1 x q16 deep + tail2048 @32K                  m= 2064 seg= 2 stock=     48568 msa=     35530 absorb=    255818 compute=       nan x=1.37 err={'TRITON_MLA': 0.0009741336107254028, 'MSA_MLA': 0.0005518943071365356, 'MSA_MLA:absorb': 0.0007929205894470215}
+4 x q16 deep + tail2048 @32K                  m= 2112 seg= 5 stock=     75595 msa=     38148 absorb=    253314 compute=       nan x=1.98 err={'TRITON_MLA': 0.001559928059577942, 'MSA_MLA': 0.0005365610122680664, 'MSA_MLA:absorb': 0.0007008761167526245}
+16 x q16 deep + tail2048 @32K                 m= 2304 seg=17 stock=    186710 msa=     44892 absorb=    269868 compute=       nan x=4.16 err={'TRITON_MLA': 0.0018957704305648804, 'MSA_MLA': 0.0005472153425216675, 'MSA_MLA:absorb': 0.000801578164100647}
+4 x q256 + tail2048 @32K                      m= 3072 seg= 5 stock=     68839 msa=     39578 absorb=    300241 compute=       nan x=1.74 err={'TRITON_MLA': 0.0016420334577560425, 'MSA_MLA': 0.0008947551250457764, 'MSA_MLA:absorb': 0.0008256882429122925}
+16 x q256 + tail2048 @32K                     m= 6144 seg=17 stock=    177537 msa=     68658 absorb=       nan compute=       nan x=2.59 err={'TRITON_MLA': 0.00199735164642334, 'MSA_MLA': 0.0007545650005340576}
+hole-only 1 x q16 deep @32K                   m=   16 seg= 1 stock=      6770 msa=      1168 absorb=      1098 compute=      3730 x=5.79 err={'TRITON_MLA': 0.0006558597087860107, 'MSA_MLA': 0.0007037371397018433, 'MSA_MLA:absorb': 0.0007037371397018433, 'MSA_MLA:compute': 0.0004966557025909424}
+hole-only 2 x q16 deep @32K                   m=   32 seg= 2 stock=     17469 msa=      6188 absorb=      2640 compute=      6161 x=2.82 err={'TRITON_MLA': 0.0008129924535751343, 'MSA_MLA': 0.0005133002996444702, 'MSA_MLA:absorb': 0.0006353408098220825, 'MSA_MLA:compute': 0.0005133002996444702}
+hole-only 4 x q16 deep @32K                   m=   64 seg= 4 stock=     37204 msa=      9473 absorb=      6217 compute=      9471 x=3.93 err={'TRITON_MLA': 0.001069784164428711, 'MSA_MLA': 0.0005030930042266846, 'MSA_MLA:absorb': 0.0006361454725265503, 'MSA_MLA:compute': 0.0005030930042266846}
+hole-only 8 x q16 deep @32K                   m=  128 seg= 8 stock=     78600 msa=     13477 absorb=     12259 compute=     13783 x=5.83 err={'TRITON_MLA': 0.001234695315361023, 'MSA_MLA': 0.000535428524017334, 'MSA_MLA:absorb': 0.0006649643182754517, 'MSA_MLA:compute': 0.000535428524017334}
+hole-only 16 x q16 deep @32K                  m=  256 seg=16 stock=    153040 msa=     14311 absorb=     23720 compute=     13954 x=10.69 err={'TRITON_MLA': 0.001404300332069397, 'MSA_MLA': 0.0005503147840499878, 'MSA_MLA:absorb': 0.0007040351629257202, 'MSA_MLA:compute': 0.0005503147840499878}
+hole-only q2048 @16K of 32K                   m= 2048 seg= 1 stock=     23180 msa=     18694 absorb=    127764 compute=       nan x=1.24 err={'TRITON_MLA': 0.0010161995887756348, 'MSA_MLA': 0.0005751252174377441, 'MSA_MLA:absorb': 0.0007514804601669312}
+nohole tail2048 @64K                          m= 2048 seg= 1 stock=     84989 msa=     70514 absorb=    506454 compute=       nan x=1.21 err=None
+rate: hole 2048 @8K + tail2048 @64K           m= 4096 seg= 2 stock=     96585 msa=     77465 absorb=    569938 compute=       nan x=1.25 err=None
+1 x q16 deep + tail2048 @64K                  m= 2064 seg= 2 stock=     96986 msa=     71789 absorb=    501013 compute=       nan x=1.35 err=None
+4 x q16 deep + tail2048 @64K                  m= 2112 seg= 5 stock=    155659 msa=     81040 absorb=    510037 compute=       nan x=1.92 err=None
+16 x q16 deep + tail2048 @64K                 m= 2304 seg=17 stock=    402772 msa=    101259 absorb=    577320 compute=       nan x=3.98 err=None
+4 x q256 + tail2048 @64K                      m= 3072 seg= 5 stock=    145092 msa=     87680 absorb=    644063 compute=       nan x=1.65 err=None
+16 x q256 + tail2048 @64K                     m= 6144 seg=17 stock=    360955 msa=    144046 absorb=       nan compute=       nan x=2.51 err=None
+hole-only 1 x q16 deep @64K                   m=   16 seg= 1 stock=     14151 msa=      2571 absorb=      2513 compute=      7687 x=5.50 err=None
+hole-only 2 x q16 deep @64K                   m=   32 seg= 2 stock=     35642 msa=     13276 absorb=      5707 compute=     13309 x=2.68 err=None
+hole-only 4 x q16 deep @64K                   m=   64 seg= 4 stock=     78333 msa=     20593 absorb=     13561 compute=     20280 x=3.80 err=None
+hole-only 8 x q16 deep @64K                   m=  128 seg= 8 stock=    154375 msa=     28487 absorb=     24941 compute=     28028 x=5.42 err=None
+hole-only 16 x q16 deep @64K                  m=  256 seg=16 stock=    312135 msa=     29468 absorb=     47173 compute=     28922 x=10.59 err=None
+hole-only q2048 @32K of 64K                   m= 2048 seg= 1 stock=     46276 msa=     37973 absorb=    267785 compute=       nan x=1.22 err=None
+fresh 8192                                    m= 8192 seg= 1 stock=     21275 msa=     17858 absorb=       nan compute=       nan x=1.19 err={'TRITON_MLA': 0.014019966125488281, 'MSA_MLA': 0.014019966125488281}
+[rank0]:[W1011 18:38:59.597104911 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
