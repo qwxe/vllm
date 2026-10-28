@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """holes/core: KV cache manager and scheduler (CPU only)."""
 
+from unittest.mock import patch
+
 try:
     from . import holes_utils as U
 except ImportError:  # run as a script
@@ -18,6 +20,7 @@ def _mgr(enabled=True, min_reuse=1, num_blocks=100):
         U.kv_cache_config(num_blocks),
         max_model_len=8192,
         hash_block_size=U.BS,
+        scheduler_block_size=U.BS,
         enable_caching=True,
         log_stats=True,
         hole_config=HoleConfig(enabled=enabled, min_reuse_blocks=min_reuse),
@@ -40,7 +43,7 @@ def test_lookup_continues_past_miss():
     assert mgr.evict_cached_token_range(a, 3 * U.BS, 6 * U.BS) == 3
     b = U.make_request("b", PROMPT)
     # Stock lookup stops at the first miss.
-    blocks, n = mgr.get_computed_blocks(b)
+    blocks, n, _ = mgr.get_computed_blocks(b)
     assert n == 3 * U.BS
     # Hole-aware lookup continues: frontier at 10 blocks, one hole.
     kvb, frontier, holes, loads = mgr.get_computed_blocks_with_holes(b)
@@ -96,6 +99,23 @@ def test_disabled_is_stock():
     assert not mgr.holes_enabled
 
 
+def test_hole_lookups_record_stats_only_when_admitted():
+    mgr = _mgr()
+    a, _ = _fill(mgr)
+    mgr.evict_cached_token_range(a, 3 * U.BS, 6 * U.BS)
+    b = U.make_request("b", PROMPT)
+    mgr.make_prefix_cache_stats()
+    for _ in range(2):
+        _, frontier, holes, loads = mgr.get_computed_blocks_with_holes(b)
+    stats = mgr.make_prefix_cache_stats()
+    assert stats is not None and stats.requests == 0
+    hits = frontier - sum(e - s for s, e in holes + loads)
+    mgr.record_prefix_cache_stats(b, hits)
+    stats = mgr.make_prefix_cache_stats()
+    assert stats is not None and stats.requests == 1
+    assert stats.hits == 7 * U.BS
+
+
 def test_min_reuse_blocks():
     mgr = _mgr(min_reuse=3)
     a, _ = _fill(mgr)
@@ -115,8 +135,11 @@ def test_can_fit_counts_holes():
     kvb, frontier, holes, _ = mgr.get_computed_blocks_with_holes(b)
     assert holes == [(0, 128)] and frontier == 160
     # Needs 8 hole blocks + 1 tail block + touch 2 hits = 11 <= 13 free.
-    assert mgr.can_fit_full_sequence(b, num_new_computed_tokens=frontier,
-                                     new_computed_blocks=kvb)
+    assert mgr.allocate_slots(
+        b, 1, num_new_computed_tokens=frontier,
+        new_computed_blocks=kvb, hole_ranges=holes,
+        full_sequence_must_fit=True,
+    ) is not None
 
 
 # ---------------------------------------------------------------- scheduler
@@ -145,16 +168,28 @@ def _scheduler_with_hole(holes_cfg, prompt, hole, **kw):
 def test_scheduler_hole_then_tail():
     prompt = list(range(1, 1 + 64 * U.BS + 5))  # 1029 tokens
     s = _scheduler_with_hole({"enabled": True}, prompt, (128, 384))
+    s.kv_cache_manager.make_prefix_cache_stats()
     b = U.make_request("b", prompt)
     s.add_request(b)
-    out = U.step(s)
+    stats = {}
+    scheduler_stats = []
+    out = U.step(s, prefill_stats=stats, scheduler_stats=scheduler_stats)
     assert out.scheduled_hole_ranges == {"b": [(128, 384)]}
     # frontier = 1024 (64 blocks), tail = 5 tokens, hole = 256 tokens
     assert out.num_scheduled_tokens["b"] == 256 + 5
     assert b.num_computed_tokens == 1029 and b.pending_hole_ranges == []
-    assert b.num_cached_tokens == 1024 - 256
+    assert stats["b"].num_cached_tokens == 1024 - 256
+    cache_stats = scheduler_stats[0].prefix_cache_stats
+    assert cache_stats.requests == 1 and cache_stats.hits == 1024 - 256
     # Prefill done in one step: a token was sampled.
     assert b.num_output_tokens == 1
+
+
+def test_holes_force_v1_even_when_v2_is_explicitly_requested():
+    with patch("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", True):
+        s = U.make_scheduler({"enabled": True})
+        assert not s.vllm_config.use_v2_model_runner
+        assert not s.use_v2_model_runner and s.holes_enabled
 
 
 def test_scheduler_big_hole_chunks_front_first():
@@ -221,6 +256,9 @@ class FakeMaskConnector:
     def __init__(self, blocks):
         self.blocks = set(blocks)
         self.calls = []
+
+    def on_new_request(self, request):
+        pass
 
     def get_block_hit_mask(self, request, local_hit):
         n = (request.num_tokens - 1) // U.BS

@@ -701,6 +701,20 @@ class VllmConfig:
 
     @property
     def use_v2_model_runner(self) -> bool:
+        from vllm.v1.core.holes import get_hole_config
+
+        if get_hole_config(self).enabled:
+            if (
+                self.attention_config.hisparse_config is not None
+                or getattr(self, "watermark_config", None) is not None
+            ):
+                raise ValueError(
+                    "Holes require Model Runner V1 and cannot be combined with "
+                    "HiSparse or watermarking, which require Model Runner V2."
+                )
+            logger.info_once("Holes are enabled; forcing Model Runner V1.")
+            return False
+
         if self.attention_config.hisparse_config is not None:
             if envs.VLLM_USE_V2_MODEL_RUNNER is False:
                 raise ValueError(

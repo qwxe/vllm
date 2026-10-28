@@ -1463,7 +1463,14 @@ class Scheduler(SchedulerInterface):
                         )
 
                 # Record at admission so unscheduled lookups are not counted.
-                if did_prefix_cache_lookup:
+                if hole_mode:
+                    self.kv_cache_manager.record_prefix_cache_stats(
+                        request,
+                        num_new_local_computed_tokens
+                        - range_tokens(new_holes)
+                        - range_tokens(load_ranges),
+                    )
+                elif did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
                         request, num_new_local_computed_tokens
                     )
