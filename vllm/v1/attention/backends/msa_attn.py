@@ -20,7 +20,8 @@ a drop-in backend for ordinary prefill / decode / mixed batches.
 
 Select with `--attention-backend MSA`. Knobs (env): MSA_MODE in
 {a, b, c, bc, auto} (default auto), MSA_EPS (0.05), MSA_C (2.0).
-Not supported: alibi, sliding window, softcap, sinks, fp8 KV, encoder
+Not supported: non-causal attention, R-SWA, async speculative decode,
+alibi, sliding window, softcap, sinks, fp8 KV, encoder
 attention, CUDA graphs for attention (the work list changes per step;
 piecewise graphs still cover the rest of the model).
 """
@@ -80,10 +81,7 @@ def msa_segments(cm: CommonAttentionMetadata) -> tuple[np.ndarray, np.ndarray]:
         seg = np.stack([row, cu[:-1], q, ends - q], axis=1)
         return seg[q > 0], kv_lens
     n = cm.num_reqs
-    if cm._seq_lens_cpu is not None:
-        seq_lens = cm._seq_lens_cpu[:n].numpy().astype(np.int64)
-    else:  # H<>D sync; the GPU model runner always passes the CPU copy
-        seq_lens = cm.seq_lens[:n].cpu().numpy().astype(np.int64)
+    seq_lens = cm.seq_lens[:n].cpu().numpy().astype(np.int64)
     qsl = cm.query_start_loc_cpu[: n + 1].numpy().astype(np.int64)
     qlen = qsl[1:] - qsl[:-1]
     seg = np.stack([np.arange(n), qsl[:-1], qlen, seq_lens - qlen], axis=1)
@@ -95,6 +93,12 @@ class MsaAttentionMetadataBuilder(AttentionMetadataBuilder[MsaAttentionMetadata]
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        if (
+            vllm_config.scheduler_config.async_scheduling
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.num_speculative_tokens > 0
+        ):
+            raise NotImplementedError("MSA: async speculative decode is not supported")
         self.block_size = kv_cache_spec.block_size
         mc = vllm_config.model_config
         self.num_heads_q = mc.get_num_attention_heads(vllm_config.parallel_config)
@@ -112,6 +116,11 @@ class MsaAttentionMetadataBuilder(AttentionMetadataBuilder[MsaAttentionMetadata]
         fast_build: bool = False,
     ) -> MsaAttentionMetadata:
         cm = common_attn_metadata
+        causal = cm.causal
+        if not (bool(causal.all()) if isinstance(causal, torch.Tensor) else causal):
+            raise NotImplementedError("MSA: non-causal attention is not supported")
+        if cm.rswa_prefix_lens is not None:
+            raise NotImplementedError("MSA: R-SWA is not supported")
         segs, kv_lens = msa_segments(cm)
         plan = plan_msa(
             segs,
@@ -174,7 +183,7 @@ class MsaAttentionImpl(TritonAttentionImpl):
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("MSA: fused output quantization")
         n = attn_metadata.num_actual_tokens
-        key_cache, value_cache = kv_cache.unbind(1)
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         msa_attention(
             query[:n],
             key_cache,
@@ -213,6 +222,14 @@ class MsaAttentionBackend(TritonAttentionBackend):
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_rswa(cls) -> bool:
         return False
 
     @classmethod
