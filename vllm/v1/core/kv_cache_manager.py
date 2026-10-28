@@ -417,13 +417,6 @@ class KVCacheManager:
         load_ranges = hits_to_holes([not x for x in loaded], bs)
         frontier = len(combined) * bs
 
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.record(
-                num_tokens=request.num_tokens,
-                num_hits=sum(b is not None for b in local) * bs,
-                preempted=request.num_preemptions > 0,
-            )
         if not blocks:
             return self.empty_kv_cache_blocks, 0, [], []
         return (

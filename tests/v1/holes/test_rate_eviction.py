@@ -24,6 +24,7 @@ from vllm.v1.core.eviction import (
     EvictionConfig,
     RateEvictionPolicy,
     chunk_recompute_s,
+    session_id_of,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -423,18 +424,29 @@ def _req(rid, prompt, session, max_tokens=4):
     )
 
 
-def _drain(s, max_steps=200):
+def test_session_id_prefers_native_and_falls_back_only_when_unset():
+    req = _req("session", [1, 2], "legacy")
+    assert session_id_of(req) == "legacy"
+    req.session_id = "native"
+    assert session_id_of(req) == "native"
+    req.session_id = ""
+    assert session_id_of(req) == ""
+    req.session_id = None
+    assert session_id_of(req) == "legacy"
+
+
+def _drain(s, max_steps=200, prefill_stats=None):
     outs = []
     for _ in range(max_steps):
         if not s.requests or all(r.is_finished() for r in s.requests.values()):
             break
-        outs.append(U.step(s))
+        outs.append(U.step(s, prefill_stats=prefill_stats))
     return outs
 
 
 def _session_trace(eviction, num_blocks=1 + 160):
     """Two sessions, 1024-token first turns; a third request fills the cache;
-    then session A's second turn. Returns the per-step trace and A2."""
+    then session A's second turn. Returns the trace, A2's prefill stats and scheduler."""
     s = _scheduler(eviction, num_blocks)
     if s.eviction_policy is not None:
         clk = Clock(0.0)
@@ -445,9 +457,10 @@ def _session_trace(eviction, num_blocks=1 + 160):
     pb = list(range(5001, 5001 + 64 * U.BS))
     pc = list(range(9001, 9001 + 40 * U.BS))
     trace = []
+    stats = {}
 
     def run():
-        for o in _drain(s):
+        for o in _drain(s, prefill_stats=stats):
             trace.append(
                 (
                     dict(o.num_scheduled_tokens),
@@ -471,7 +484,7 @@ def _session_trace(eviction, num_blocks=1 + 160):
     a2 = _req("a2", pa + [7] + list(range(20001, 20001 + 100)), "A", max_tokens=2)
     s.add_request(a2)
     run()
-    return trace, a2, s
+    return trace, stats[a2.request_id], s
 
 
 def test_lru_default_is_stock():

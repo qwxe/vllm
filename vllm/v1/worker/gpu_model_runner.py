@@ -1968,9 +1968,7 @@ class GPUModelRunner(
         # per-segment view used for the attention metadata.
         hole_segments: HoleSegments | None = None
         if scheduler_output.scheduled_hole_ranges:
-            assert not self.uses_mrope and self.uses_xdrope_dim == 0, (
-                "holes are not supported with M-RoPE / XD-RoPE"
-            )
+            assert not self.uses_mrope, "holes are not supported with M-RoPE"
             hole_segments = build_hole_segments(
                 self.input_batch.req_ids,
                 scheduler_output.scheduled_hole_ranges,

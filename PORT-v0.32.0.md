@@ -1,320 +1,316 @@
 # vLLM v0.32.0 fork port
 
-## cbb2490b6d — KV cache manager: lookup past misses, in-place hole blocks
+Status: ready for caller review; runtime correctness is unverified. AI assistance
+was used. Base: v0.32.0 (`5df63a7203cd`). This record covers the original
+single-group core/kernel/rate port and the Addendum 2 round-1 working-tree fixes.
+The caller owns commits, branch propagation and independent verification.
 
-Status: adapted. Original commit: cbb2490b6dd6ce580d8c75c55d0dec10c011d4fc.
-This section covers the stopped cherry-pick on `port/v0.32.0/holes-core`;
-HEAD remains `63ca7eb8f3369d36b27ae8e03ffb70ebe1aa57f1` until the master
-stages the resolution and continues the cherry-pick. AI assistance was used.
+## Commit inventory
 
-Preserved fork behavior:
+References prefixed `upstream` are file:line at tag v0.32.0. New files have no
+upstream counterpart. Port hashes identify the existing commits before the
+round-1 working-tree changes; the caller will commit these fixes separately.
+Historical test/benchmark numbers in the carried design documents describe the
+original fork, not this port.
 
-- Look up prompt blocks past misses, trim trailing misses and short reuse runs,
-  combine local hits with an optional connector mask, and return the frontier,
-  recompute ranges and load ranges. The final token still requires computation.
-- Touch reused blocks and replace null hole entries with fresh blocks in position
-  order. Cache hole blocks only when a scheduled range fully covers the block;
-  keep their bookkeeping separate from the ordinary cached frontier.
-- Preserve the hash-based `evict_cached_token_range` test hook.
-- Keep holes disabled by default and restrict support to one exact
-  `FullAttentionSpec` / `FullAttentionManager` group with caching enabled,
-  no DCP/PCP and no EAGLE. Other configurations retain prefix-only behavior.
+| Original commit and subject | Port commit | Status and adaptation |
+|---|---|---|
+| `72946a4c8e` Add hole config and the chunk planner | `63ca7eb8f3` | Ported as-is: new `vllm/v1/core/holes.py`, default off. |
+| `cbb2490b6d` KV cache manager: lookup past misses, in-place hole blocks | `0b2326af6d` | Adapted to the coordinator, admission, worker-zeroing and free lifecycle; details below. Round 1 moves hole cache stats to admission. |
+| `1e0690c75a` KV connector API: per-block hit mask (design + stub) | `188090acee` | Ported as-is: separate `SupportsBlockHitMask` interface; existing connector APIs retained. |
+| `ba53aee742` Scheduler: per-request hole ranges and hole chunking | `03deb36689` | Adapted to scheduling/input budgets, context reservation, statistics and in-flight accounting; details below. Round 1 forces V1 at config selection. |
+| `775f1ebad3` Model runner: explicit positions and per-segment attention | `54ba7364d2` | Adapted to common metadata and graph dispatch; details below. Round 1 removes the obsolete XD-RoPE attribute access. |
+| `f8099d814b` holes: tests and design notes for the hole-aware core | `cfebdf06a5` | Initially as-is; adapted in round 1 for the manager lookup triple, scheduler block size, admission allocation and emitted PrefillStats. Every existing assertion retains its behavioral meaning. |
+| `18fb65769f` holes: record test results from the worktree | `05d40181da` | Ported as-is: historical results only, not evidence for v0.32.0. |
+| `65f27846f1` holes: add SPDX headers and drop unused locals in the GPU e2e | `4b0c9694a6` | Ported as-is. |
+| `8ccc311181` Add MSA attention backend: hole-aware position-explicit Triton work-list kernel + planner | `b2e4624467` | Initially as-is; adapted in round 1 for exact device lengths, packed KV layout, async speculative decode rejection and explicit non-causal/R-SWA rejection; details below. |
+| `87817010b7` MSA: fp32 support, dtype-aware launch config | `98403f3d86` | Ported as-is: dtype support and launch configuration retained. |
+| `d5da837013` Add KERNEL-IMPL.md (MSA backend design, CP API, tests, 4050 benchmarks) | `eb0134f7cb` | Ported as-is: historical design/results; CP API text does not enable CP in this port. |
+| `b773a64da9` KERNEL-IMPL.md: final test counts | `e7730237c9` | Ported as-is: historical counts only. |
+| `425a6ae813` MSA: drop the machine path from the synced-file headers and a dead n_tiles | `e96faaa2d1` | Ported as-is. |
+| `f935c3463b` Add pluggable GPU block eviction with the session-state rate policy | `efeb5fb32d` | Adapted to upstream block hashes, queue ordering, cross-pool freeing and scheduler lifecycle. Round 1 prefers native Request.session_id; details below. |
+| `c6d20e9c4d` Test the rate eviction policy against the simulator's SessRatePool | `123ef20a5d` | Initially as-is; round 1 captures emitted PrefillStats instead of removed Request.num_cached_tokens; hit-count expectations retained. |
+| `bf6afedd94` Add the rate-vs-LRU GPU end-to-end on a scaled codex session workload | `e82773f38d` | Ported as-is; no GPU run performed. |
+| `32c44343b9` Add RATE-IMPL.md: rate eviction design as built, tests and 4050 results | `efb85622ae` | Ported as-is: historical results only. |
+| `e4aff3cb88` holes/rate: dataset as a flag, run-dependent e2e results, SPDX and unused import | `922f4a9f3a` | Ported as-is: dataset flag and historical-result qualifications retained. |
 
-Adaptations (upstream references below refer to tag `v0.32.0`, not fork line
-numbers):
+`3214ce8f86` merges the ported kernel into rate, replacing the original CP-mediated
+kernel/core integration. `83909ffe00` adds this port record; it is not an original
+fork patch. Core and kernel each originate at v0.32.0.
 
-- `vllm/v1/core/kv_cache_coordinator.py:559` already establishes the unitary
-  group's block size; `:565` requires hash block size to match it. Keep that
-  validation and the upstream EAGLE group setup at `:572`, adding the original
-  support predicate and hole lookup alongside them. Thus the original per-block
-  hash indexing needs no new semantics for different hash/KV block sizes.
-  Preserve hybrid managers and upstream partial-hit lookup unchanged.
-- The old `can_fit_full_sequence` method is replaced by the
-  `full_sequence_must_fit` path in `vllm/v1/core/kv_cache_manager.py:522`.
-  Add hole allocations to both this admission check and the per-step check at
-  upstream `:561`; preserve the watermark and reserved-block checks at `:573`.
-  The ported full-sequence adjustment is at `kv_cache_manager.py:661`.
-- Extend the zero-token validation at upstream `kv_cache_manager.py:474` with
-  `not hole_ranges`, preserving upstream acceptance of computed tokens being
-  adopted without new tail tokens. Append the new constructor/allocation
-  arguments after existing v0.32.0 parameters. Preserve the ordinary lookup
-  triple and connector lookup method; the separate hole lookup API retains the
-  fork's four-result contract (`kv_cache_manager.py:368`).
-- Record fresh hole block IDs using the upstream worker-zeroing predicate at
-  `vllm/v1/core/single_type_kv_cache_manager.py:115`, rather than the fork's
-  unconditional exact-full-attention check. This follows the same allocation
-  tracking contract as v0.32.0 (`single_type_kv_cache_manager.py:443` in the port).
-- Move pending-hole cleanup into `pop_blocks_for_free`, next to cached-frontier
-  and partial-hit cleanup (upstream `single_type_kv_cache_manager.py:576`).
-  Both direct frees and coordinator-mediated frees then clear hole bookkeeping.
-- Keep v0.32.0's full-attention fine-grained lookup and tail caching intact;
-  insert the separate `find_cache_hits_with_holes` class method at ported
-  `single_type_kv_cache_manager.py:897` instead of replacing that upstream logic.
+## Core adaptations
 
-Checks performed:
+### cbb2490b6d — lookup and allocation
 
-```bash
-PYTHONPYCACHEPREFIX=/tmp/vllm-port-cbb2490b6d-pycache /home/asd/LLMServingSim/.wt/testenv/bin/python -m py_compile vllm/v1/core/kv_cache_coordinator.py vllm/v1/core/kv_cache_manager.py vllm/v1/core/single_type_kv_cache_manager.py
-```
+- Preserve one exact FullAttentionSpec/FullAttentionManager group, caching on,
+  no DCP/PCP, no EAGLE. Upstream `vllm/v1/core/kv_cache_coordinator.py:559`
+  establishes block size and `:565` validates hash alignment. Keep hybrid
+  partial-prefix lookup and EAGLE setup (`:572`) unchanged.
+- Keep the ordinary three-result lookup and the connector lookup API. The new
+  hole lookup returns blocks, frontier, recompute ranges and load ranges.
+  Preserve minimum reuse runs and final-token recomputation.
+- Replace removed `can_fit_full_sequence` with hole block accounting in both
+  `allocate_slots(full_sequence_must_fit=True)` (upstream
+  `vllm/v1/core/kv_cache_manager.py:522`) and per-step admission (`:561`),
+  retaining upstream watermark/reservations (`:573`). Accept hole-only work
+  in the zero-token validation (`:474`).
+- Track new hole blocks through the worker-zeroing predicate (upstream
+  `vllm/v1/core/single_type_kv_cache_manager.py:115`). Clear pending holes in
+  `pop_blocks_for_free` (`:576`), including coordinator-mediated frees.
+  Cache only the scheduled hole pieces; keep ordinary partial-hit/CoW logic.
+- Round 1: hole lookup no longer records prefix stats. The scheduler records
+  one query at successful admission, matching upstream
+  `vllm/v1/core/sched/scheduler.py:1475`; local hits exclude recompute and
+  connector-load ranges. Retried or rejected lookups add no query.
 
-Result: PASS (exit 0). Used the brief's existing host test environment; no
-packages were installed and no project modules were imported or executed.
-Behavioral tests, independent verification, model evaluation, GPU jobs and
-simulator runs were not performed; verification is assigned to the caller.
-No tests were modified. No git command that writes was run; git's unmerged
-index entries remain for the master to resolve by staging the edited files.
+### ba53aee742 — scheduling
 
-Questions: none for this commit. Hybrid/Mamba hole behavior remains outside the
-original commit's supported scope; this port does not introduce it.
+- Retain scheduler/hash block sizes, watermark and Mamba checkpoint arguments
+  at upstream `vllm/v1/core/sched/scheduler.py:328`. Gate on `not use_eagle`,
+  including when EAGLE block drop is disabled (`:315`).
+- Preserve running-request cadence, DP/encoder guards (`:680`), effective
+  long-prefill threshold (`:645`) and sampled-token context reservation
+  (`:152`). Bound the planner by scheduler and worker-input budgets minus
+  drafting slots; reserve metadata entries for extra segments before further
+  admissions (`:923`). Only tail work advances the request frontier.
+- Keep ordinary `_get_local_prefix_cache_hit` (`:558`) and deferred queue
+  handling (`:904`). Keep unknown connector masks deferred, async masks as
+  misses, synchronous range loads and per-request in-flight accounting.
+- Use PrefillStats for local/external cache hits; keep v0.32.0 output and
+  speculative metrics. Preemption clears pending holes.
+- Round 1: `VllmConfig.use_v2_model_runner` (upstream
+  `vllm/config/vllm.py:703`) reads the same HoleConfig as the scheduler.
+  Enabled holes force V1, including an explicit V2 environment override, with
+  an info-once log. HiSparse/watermarking require V2 (`:704`, `:712`), so their
+  combination with enabled holes raises an explicit configuration error.
+  With holes off, upstream runner selection remains unchanged.
 
-## ba53aee742 — Scheduler: per-request hole ranges and hole chunking
+### 775f1ebad3 — runner and segment metadata
 
-Status: adapted; ready for caller review, not independently verified. Original
-commit: ba53aee74216af475500d75485b099bc8d13550c.
-This section covers the stopped cherry-pick on `port/v0.32.0/holes-core`;
-HEAD remains `188090aceea741d870e1a7a7e47e2f9a3e64364f` until the master
-stages the resolution and continues the cherry-pick. AI assistance was used.
-The branch, stopped files and original diff match this call's brief. Addendum 1
-supersedes the brief's original git-write instructions; no git write was run.
+- Preserve every upstream common metadata field (upstream
+  `vllm/v1/attention/backend.py:415-474`), adding an optional hole_segments.
+  Use segment ends for seq_lens_cpu_upper_bound; clear derived caches.
+  Computed-token counts derive from exact device lengths/query boundaries
+  (`:486`); removed CPU fields are not restored.
+- Repeat row metadata with the block table: prefill/causal flags, encoder/DCP
+  fields, request indices, multimodal ranges, R-SWA lengths and ReplaySSM
+  origins. Positions/slot mappings retain token order. In particular, the
+  added req_idx fallback is `seg.seg_req_idx.copy()` when cm.req_idx is None;
+  the encoder_seq_lens selection is also added, though downstream group
+  handling overwrites it. These are listed for r1 m2, not new hybrid support.
+- Keep upstream metadata construction (upstream
+  `vllm/v1/worker/gpu_model_runner.py:2397`), then expand segments. Keep logits
+  and sampling boundaries at request granularity.
+- Cascade was removed (`:531`, `:3724`); exclude FULL graphs in the dispatcher
+  (`:3762`), including DP redispatch (`:3797`). Combine the hole guard with
+  upstream microbatching decisions (`:4038`).
+- Round 1: v0.32.0 retains uses_mrope (`:542`) but has no uses_xdrope_dim or
+  XD-RoPE runner path. Reject M-RoPE using the existing attribute; remove the
+  obsolete attribute access instead of reintroducing removed upstream state.
+  Single-group/no-DCP/no-microbatch hole restrictions remain.
 
-Preserved fork behavior:
+## Kernel adaptations — 8ccc311181, round 1
 
-- Store sorted pending hole ranges on each request. Plan waiting and running
-  requests front first through `plan_step`, then compute the tail. Allocate
-  missing blocks in position order and cache only the scheduled hole pieces.
-- Carry `scheduled_hole_ranges` alongside the total scheduled token count.
-  Only tail work advances `num_computed_tokens`; subtract completed pieces
-  from pending ranges and clear pending ranges when preempting a request.
-  PP token-ID payloads exclude hole tokens already available in the prompt.
-- Keep holes off by default, with the previous cache-manager support predicate;
-  disable them for the V2 runner, EAGLE-family speculation, encoder inputs and
-  connectors without `SupportsBlockHitMask`. Unknown masks defer admission;
-  asynchronous masks are treated as misses with a warning once. Synchronous
-  range loads are recorded with `update_state_after_alloc_with_ranges`.
-- Retain the scheduler's `holes_evict_token_range` test hook.
+- Ordinary rows use `cm.seq_lens[:num_reqs].cpu()` for exact lengths. Upstream
+  `vllm/v1/attention/backend.py:444` calls the CPU copy an upper bound under
+  async speculative decode. Do not use it or restore removed _seq_lens_cpu.
+  Hole rows continue to use their explicit segment ends.
+- Reject async scheduling combined with positive speculative-token count in
+  the MSA metadata builder, matching the runner's async-spec predicate
+  (upstream `vllm/v1/worker/gpu_model_runner.py:683`). This follows the binding
+  r1 B2 decision and makes the host synchronization explicit.
+- Read the inherited packed cache `[blocks, kv_heads, block_size, 2*head_size]`
+  with `transpose(1, 2).split(head_size, dim=-1)`, matching upstream
+  `vllm/v1/attention/backends/triton_attn.py:795`. The resulting K/V views are
+  `[blocks, block_size, kv_heads, head_size]`; MSA already passes their strides
+  to its kernels. Do not unbind the head dimension.
+- Override supports_non_causal and supports_rswa to False, instead of
+  inheriting upstream True (`triton_attn.py:327`, `:335`). Also reject
+  non-causal row metadata and non-None R-SWA lengths in build. The original
+  causal kernel remains unchanged.
 
-Adaptations (upstream references refer to tag `v0.32.0`):
+## Rate adaptations — f935c3463b
 
-- Preserve all cache-manager constructor arguments at
-  `vllm/v1/core/sched/scheduler.py:328`, including separate scheduler/hash block
-  sizes, watermark and Mamba shared-prefix checkpoints; append `hole_config`.
-  Upstream `:315` separates `use_eagle` from `use_eagle_block_drop`. Gate holes
-  on `not self.use_eagle` as well as the manager predicate, preserving the
-  fork's no-EAGLE restriction even when upstream disables trailing-block drops.
-- Keep the upstream running-request cadence, DP prefill and encoder-connector
-  guards at `scheduler.py:680`. Feed both scheduler and remaining worker-input
-  budgets (minus drafting slots) to the planner, using upstream's effective
-  long-prefill threshold at `:645`. Preserve the model-specific sampled-token
-  context reservation at `:152` when bounding the planner's tail endpoint.
-  Soft chunk limits can still extend to a segment end within the hard budget,
-  as the fork planner specifies. Ordinary requests keep the upstream path.
-- Preserve the upstream active-request admission limit at `scheduler.py:923`.
-  Account for extra hole segments before admitting another request so later
-  admissions cannot consume metadata entries already reserved by hole pieces;
-  `plan_step` retains the fork's per-request segment cap.
-- Keep `_get_local_prefix_cache_hit` at `scheduler.py:558` and its four-result
-  hybrid/partial-prefix contract for ordinary requests. Add the separate
-  four-result hole lookup ahead of it; do not replace the upstream lookup with
-  the fork's old two-result unpack. Use the upstream queue helper at `:904`
-  for an unavailable mask, preserving deferred-waiting and KV-holding queues.
-- Upstream `vllm/v1/request.py:218` uses `PrefillStats`, not the fork's removed
-  `Request.num_cached_tokens`. Populate it as at `scheduler.py:1075`, counting
-  local hits as frontier minus recompute holes and connector-load ranges, and
-  external hits as the load-range length. The existing hole manager records
-  its own prefix-hit statistics, so do not also record the frontier as hits.
-- Preserve DP prefill deferral at `scheduler.py:1113`, bounded SWA replay and
-  ordinary Mamba/encoder/MTP scheduling. At the waiting allocation at `:1257`,
-  pass only work beyond the adopted hit (subtract hole pieces and replay),
-  retain full-sequence admission, reservation and zeroing arguments, and append
-  `hole_ranges`. Count only tail work when tracking in-flight prefills and
-  determining speculative-token counts (`:1377` and `:862`).
-- Preserve every upstream output field at `scheduler.py:1516` and
-  `vllm/v1/core/sched/output.py:299`, including zeroing, CoW, connector block
-  state, dynamic speculation and encoder-manager metadata. Append the defaulted
-  hole-range field; mark range loads in `has_sync_kv_loads` as well.
-- Upstream `scheduler.py:1630` tracks all scheduled work in
-  `num_in_flight_tokens`, and `:2082` drains the total scheduled count. Increment
-  that counter before subtracting hole work for frontier advancement; otherwise
-  a hole-only step would make the counter negative when its output returns.
+- Default LRU installs no policy. Preserve the original rate/group scoring,
+  ownership, lazy versions, session tracker and uncached-first allocation.
+  Preserve prefix caching/single group/no connector/no DCP/PCP restrictions.
+- Preserve reuse watchers (upstream `vllm/v1/core/block_pool.py:666-727`) and
+  register unpin_blocks frees (`:708`) with the policy. Remove primary and
+  partial hashes through upstream `_remove_cached_block_hashes` (`:590`),
+  then call on_uncache and retain removal events/group IDs (`:729`).
+- Keep upstream free_blocks (`:774`): prepend uncached blocks, append cached
+  blocks and route foreign blocks to their owning pool. Notify only this
+  pool's newly free non-null blocks after insertion, in original input order.
+- Register request ownership when its table is popped (upstream
+  `vllm/v1/core/single_type_kv_cache_manager.py:562`); leave physical freeing
+  to its existing caller (`:581`). Preserve scheduler stale-output handling
+  (`vllm/v1/core/sched/scheduler.py:2166`), arrivals (`:2616`), cleanup and the
+  _free_request tuple contract (`:2714`).
+- Round 1: session_id_of uses Request.session_id when non-None, including an
+  empty string; otherwise use sampling_params.extra_args["session_id"].
+  This follows the r1 m5 decision and upstream `vllm/v1/request.py:197`.
 
-Checks performed:
+## CP carried and dropped work
 
-```bash
-PYTHONPYCACHEPREFIX=/tmp/vllm-port-ba53aee742-pycache /home/asd/LLMServingSim/.wt/testenv/bin/python -I -m py_compile vllm/v1/core/sched/output.py vllm/v1/core/sched/scheduler.py vllm/v1/request.py
-git diff --check HEAD -- vllm/v1/core/sched/output.py vllm/v1/core/sched/scheduler.py vllm/v1/request.py
-```
+CP commits carried: **none**. Rate uses the core scheduler and block-pool hooks;
+its original CP ancestry adds no required rate dependency. v0.32.0 already has
+unpin_blocks/reuse watchers and cross-pool freeing. MSA comes directly from
+holes/kernel. CP implementations, placement options and benchmarks remain out
+of scope, as do server/MLA and the separately approved multi-group extension.
 
-Results: both PASS (exit 0, no diagnostics). The three Python files contain no
-conflict markers. Used the brief's existing host test environment; no packages
-were installed and no project modules or downloaded sources were executed.
-Behavioral tests, independent verification, model evaluation, GPU jobs and
-simulator runs were not performed; verification is assigned to the caller.
-Worker consumption of the hole metadata belongs to subsequent fork commits
-and is not established by syntax compilation. No tests were modified.
-Git's unmerged index entries remain for the master to stage and continue.
+The following original CP-only commits are dropped from this port:
 
-Questions: none for this commit. No hybrid/Mamba or other unsupported hole
-semantics were introduced. Implementation adaptations above are inferred from
-the original fork contracts and pinned upstream structures; syntax/whitespace
-checks are the only executed checks, not behavioral acceptance.
+| Original | Reason |
+|---|---|
+| `f2d9739ebf` | CP schemes/reference local attention. |
+| `11ea11ec22` | CP PCP slot mapping/tests. |
+| `16b5e6d816` | CP tiled PyTorch attention benchmark. |
+| `97a4ffbd75` | CP_HOLES backend glue. |
+| `9e5a2a31b2` | CP gloo glue tests. |
+| `4b6110d182` | Multi-GPU CP checks/benchmarks. |
+| `ed75704555` | CP benchmark layout fixes. |
+| `1af1bfb6ca` | CP partial-state combine. |
+| `f1998e3f8f` | CP plan index device copies. |
+| `90745e4518` | CP implementation/server plan documentation. |
+| `2144ce6f33` | CP merge of core; core is carried directly. |
+| `7946f9a935` | CP consumption of core segments. |
+| `17056ca2cf` | CP fork/core documentation. |
+| `755188b3c9` | CP KV placement option. |
+| `81a19c121e` | CP sharded dense layers. |
+| `1119d5affd` | CP local-attention selection/checks. |
+| `2692b859e7` | CP-specific planner budgets. |
+| `a796e94b71` | CP KV-slot validity. |
+| `87f6bfee39` | CP merge of kernel; kernel is carried directly. |
+| `148d29dde4` | CP local MSA attention. |
+| `2c8adc24df` | CP MSA benchmarks. |
+| `ade5d6490f` | CP placement/sharding documentation. |
+| `f9373161d5` | CP merge of kernel cleanup; cleanup carried directly. |
+| `f5725b5ef1` | CP merge of core cleanup; cleanup carried directly. |
+| `831801da62` | CP-only SPDX/import cleanup. |
+| `053addf171` | CP merge into rate; replaced by direct core/kernel integration. |
 
-## 775f1ebad3 — Model runner: explicit positions and per-segment attention
+Non-qwxe upstream commits in the old ancestry are not re-applied: `b92312dfd7`,
+`12449f9492`, `69b8bd4b33`, `bcc0fdd0f3`, `268bed9cf3`, `0ee3b7fc3d`,
+`1dbbafd3f3`, `29982d48b3`, `3a30a1a6a8`, `c284a6671c`, `cfad6a509c`,
+`8adcf8c40a`, `2a69949bda`. They are upstream/superseded, per the brief;
+v0.32.0 remains authoritative.
 
-Status: adapted; ready for caller review, not independently verified. Original
-commit: 775f1ebad3b1cd258518c6f8039e592a52f1d639.
-This section covers the stopped cherry-pick on `port/v0.32.0/holes-core`;
-HEAD remains `03deb36689a6e4048789ad36ec62433e91700b75` until the master
-stages the resolution and continues the cherry-pick. AI assistance was used.
-Addendum 1 governs this call; no git command that writes was run.
+## Round-1 finding disposition
 
-Preserved fork behavior:
+| Finding | Working-tree disposition |
+|---|---|
+| Sol 1 / Opus B2 | Exact device lengths; async speculative decode explicitly rejected. |
+| Sol 2 / Opus B1 | Packed KV split matching v0.32.0. |
+| Opus B3 | Removed obsolete uses_xdrope_dim access; retained M-RoPE rejection. |
+| Sol 3 / Opus B4 | Tests use scheduler_block_size, lookup triple, full_sequence_must_fit allocation and emitted PrefillStats. No assertion deleted, loosened or skipped. |
+| Sol 4 | Non-causal and R-SWA capability flags false, metadata explicitly rejected. |
+| Opus M1 | Logged forced V1 at config selection; V2-only features conflict explicitly. |
+| Opus M2 | Complete inventory, CP disposition, check limits and Q-list in this record; stale stopped-cherry-pick statements removed. |
+| m1 | Hole cache statistics moved from lookup to admission, excluding holes and external loads. |
+| m2 | Added req_idx fallback and encoder_seq_lens selection listed above; no code change. |
+| m3 | Record only: planner tail is capped by min(num_tokens, max_model_len - num_sampled_tokens_per_step); budget by min(token_budget, input_budget - draft_slots). The _reserve_prefill_lookahead miscount is a no-op because hole lookahead is zero. |
+| m4 | Record only: rate still treats hash-less unpin_blocks frees as first candidates; upstream uses these as last resort for HiSparse. HiSparse is excluded by the original hole gate and now explicitly conflicts with forced V1. No policy algorithm change. |
+| m5 | Native session_id first, legacy fallback only when unset. |
+| m6 | Record only: existing subjects lack the requested '(ported to v0.32.0)' suffix except the merge. No Git history write is authorized; caller owns history disposition. |
+| m7 | Record only: MSA is the fork hole-aware backend; upstream CUTLASS_MSA/TRITON_MSA refer to MiniMax sparse attention. Enum names do not collide; no rename/interface change. |
 
-- Lay out each request's scheduled hole pieces in position order, followed by
-  its tail. Gather token IDs using those explicit positions, copy the positions
-  to the GPU before computing slot mappings, and subtract hole-token counts
-  from both CPU optimistic and GPU request-level sequence lengths.
-- Keep request-level query boundaries for logits and sampling; give attention
-  one varlen entry per segment, with its end as sequence length and its
-  request's block-table row repeated. Attach the `HoleSegments` view to common
-  metadata. Keep the original M-RoPE / XD-RoPE rejection and single-group,
-  no-DCP, no-microbatching assertions.
-- Disable FULL CUDA graphs and microbatching on steps with holes. Preserve
-  the existing scheduler/cache-manager support restrictions from prior ports.
+## Checks and could-not-check
 
-Adaptations (upstream references refer to tag `v0.32.0`):
+The only execution in this call is isolated host-interpreter py_compile on all
+touched Python files; no project modules or downloaded sources are imported or
+executed. The existing host test environment is
+`/home/asd/LLMServingSim/.wt/testenv`; no packages are installed. Exact command and
+results are recorded below after completion. Read-only `git diff --check` is
+also run. Syntax and whitespace results do not establish runtime correctness.
 
-- Keep every upstream common-metadata field at
-  `vllm/v1/attention/backend.py:444`–`:474`; add only the optional
-  `hole_segments` field (`backend.py:473` in the port). Do not restore the
-  deprecated `_seq_lens_cpu` / `_num_computed_tokens_cpu` fields removed
-  upstream. In `vllm/v1/worker/hole_segments.py:126`, populate
-  `seq_lens_cpu_upper_bound` with segment ends and clear both derived caches.
-  Upstream `backend.py:486` derives computed-token counts from device sequence
-  lengths and query boundaries; those now give each segment's start directly.
-- Repeat optional row metadata alongside the block table: prefill flags,
-  tensor causal flags, encoder/DCP fields, request indices, multimodal ranges,
-  R-SWA prefix lengths and ReplaySSM origins. This preserves the row contracts
-  at upstream `backend.py:415`–`:471` when a request becomes several segments;
-  token-level positions and slot mappings keep their flattened token order.
-  This transformation does not enable hybrid/Mamba or context-parallel holes.
-- Preserve upstream's linear-attention import and metadata-builder handling;
-  place the new helper import with worker imports. Keep upstream construction
-  at `vllm/v1/worker/gpu_model_runner.py:2397`, then convert the common metadata
-  to segments (`gpu_model_runner.py:2456` in the port).
-- Upstream `gpu_model_runner.py:531` has removed cascade attention and
-  `:3724` marks `use_cascade_attn` ignored. Do not restore the removed cascade
-  computation. Append a defaulted `disable_full_cudagraph` argument to the
-  execution/padding helper and apply its FULL exclusion in the dispatcher
-  closure at upstream `:3762`, including the DP redispatch at `:3797`.
-  Combine the hole guard with upstream's `_allow_microbatching` call at
-  `:4038`; ordinary steps retain that upstream decision. The caller passes
-  the segment view to attention construction (`gpu_model_runner.py:4208`
-  in the port).
+Tests adapted: manager/scheduler API calls, emitted cache statistics capture in
+holes_utils.step and the rate trace, and the fake mask connector's upstream
+on_new_request no-op hook. Original cache-hit counts, segment ordering,
+frontiers, admission success and no-hole identity assertions are retained.
+Added regressions cover lookup statistics versus admission, forced V1 despite
+explicit V2, exact MSA lengths despite optimistic bounds, K/V views with 1/2/4
+heads, and native-session precedence/fallback. These tests are unexecuted here.
 
-Checks performed:
+Not verified: CPU behavioral tests/imports, MSA GPU numerics, kernel performance,
+DP graph redispatch, PIECEWISE padding, per-segment FA/Triton builders, manager
+versus MSA block size, prompt-embed positions, connector load execution,
+preemption/runtime scheduling, model output/evaluations and end-to-end GPU/rate
+runs. No simulator, GPU, container, profiler, benchmark, download or agent is
+launched. The host lacks a compatible torch/vLLM test installation; the brief
+assigns independent verification to the caller. No baseline behavioral suite or
+quick golden run is claimed. Prior per-commit syntax-check records do not prove
+this round's runtime behavior or acceptance.
 
-```bash
-PYTHONPYCACHEPREFIX=/tmp/vllm-port-775f1ebad3-pycache /home/asd/LLMServingSim/.wt/testenv/bin/python -I -m py_compile vllm/v1/attention/backend.py vllm/v1/worker/gpu_model_runner.py vllm/v1/worker/hole_segments.py
-git diff --check HEAD -- vllm/v1/attention/backend.py vllm/v1/worker/gpu_model_runner.py vllm/v1/worker/hole_segments.py
-```
+## Q-list
 
-Results: both PASS (exit 0, no diagnostics). No conflict markers remain in
-these Python files. Used the brief's existing host test environment; no
-packages were installed and no project modules or downloaded sources were
-imported or executed. Behavioral tests, independent verification, model
-evaluation, GPU jobs and simulator runs were not performed; verification is
-assigned to the caller. No tests were modified. Syntax/whitespace checks do
-not establish runtime correctness or backend compatibility. Git's unmerged
-index entries remain for the master to stage and continue.
+Open questions: **none for this authorized single-group round**.
+The binding decision row 'Fork port r1 answers 2026-10-28' settles forced V1,
+exact GPU lengths plus async-spec rejection, and native session precedence.
+V2 holes and multi-group/hybrid Mamba/SWA holes remain separately scoped work;
+this port retains its original support gate and does not select their semantics.
 
-Questions: none for this commit. The adaptations follow the original segment
-contract and v0.32.0 field/dispatch contracts; no new unsupported hole
-semantics were selected.
+## Round-1 worker receipt
 
-## f935c3463b — Pluggable GPU block eviction with the session-state rate policy
+Status: DONE_WITH_CONCERNS (ready for caller review, not acceptance).
 
-Status: adapted; ready for caller review, not independently verified. Original
-commit: f935c3463b7436432d16bc2516378f6ce70cc026.
-This section covers the stopped cherry-pick on `port/v0.32.0/holes-rate`;
-HEAD remains `3214ce8f8622432bdc6eb6f8b6e3096a714b4c54` until the master
-stages the resolution and continues the cherry-pick. AI assistance was used.
-Addendum 1 governs this call; no git command that writes was run.
+Done: all blocking/major findings and m1/m5 have working-tree fixes; m2 is
+listed, and m3/m4/m6/m7 are recorded only, as Addendum 2 directs.
+Not done: runtime tests and independent verification; caller-owned Git commits
+and propagation to core/kernel were not attempted.
 
-Read / assumptions:
+Read: the complete task brief including both addenda and quoted 0.3; both r1
+reviews; cited RESEARCH II.1 decisions including the r1 answers and superseded
+entries; local AGENTS.md; the task-worker selector/card and CODEX own rules;
+INTERFACE I.10, I.12, I.13, I.14 and I.19; IMPLEMENTER duties/pitfalls;
+RECORDS I.8 and FORMATS I.24 report fields; affected source/tests and the previous
+port record. No newer named handoff is supplied beyond the reviews/decision row.
 
-- Read the full task brief and Addendum 1, preceding port sections, original
-  `git show f935c3463b`, the three conflicted files and the new `eviction.py`.
-  The branch, HEAD and stopped paths match this call's premises.
-- Rule-source provenance is `43ca3a4a99c3171401b04fa388d20f95aff6c043`;
-  actual rule read revision is main `57fee9f3b14efcaf734141f2cd1ddec5c9cdcfdb`
-  in `/home/asd/LLMServingSim`. Read the task-worker selector/card and Codex
-  own rules, never-break section, implementation duties/pitfalls, applicable
-  INTERFACE I.10–I.14/I.19, RECORDS I.8 and FORMATS report fields. The newer
-  decisions retain master-only git writes and explicitly sequence the original
-  single-group core/rate port before a separately designed multi-group extension.
-- The adaptations below follow the original policy hooks and upstream block
-  lifetimes. Their behavioral equivalence is inferred, not established by the
-  syntax checks. No new eviction algorithm or hybrid semantics were selected.
+Assumptions: brief rule-source commit is `43ca3a4a9`; actual main read revision
+is `1a2ddcf5b8c99329a9bfdce5888d77c821858a08`, matching the caller's current
+revision. Addendum 2 and the current r1 decision row govern over the original
+branch-creation instructions. Read-only checks confirmed a clean starting tree,
+rate HEAD `83909ffe0030b714641b6ec5a1c00c94efde8f05`, core
+`4b0c9694a6772768496c1c7828cea52ff045ffda`, kernel
+`e96faaa2d16366e333ca25405fa473e2d1a00e19`. No Git write was run.
+The explicit error for holes plus HiSparse/watermarking follows their conflicting
+V1/V2 requirements; silently selecting either runner would violate one of them.
+The test helper optionally captures emitted PrefillStats and SchedulerStats
+because update_from_output transfers/resets them. This is test-only plumbing;
+incorrect capture would cause the cache-hit regressions to fail. Replacing the
+obsolete XD-RoPE check follows its complete removal upstream, not new position
+semantics. No other behavior/scope decision was selected.
 
-Preserved fork behavior:
-
-- LRU remains the default and installs no policy. Preserve `eviction.py`
-  unchanged: configuration/environment overrides, empirical session rates,
-  chunk-position recompute costs, owner tracking, whole-group eviction,
-  uncached-first allocation, lazy heap versions and rescore cadence.
-- Attach the policy only with prefix caching, one KV cache group, no connector
-  and no DCP/PCP, as in the original commit. Retain the warning when hole-aware
-  lookup is disabled. Arrival, first sampled token and request finish feed the
-  session tracker; freeing a request records its block-table ownership.
-- Keep allocation/touch/free/uncache/reset hooks and existing cache metrics,
-  reference counts and reuse notifications.
-
-Adaptations (upstream references refer to tag `v0.32.0`):
-
-- Preserve `Callable` and the upstream reuse watchers in
-  `vllm/v1/core/block_pool.py:666`–`:727`. Policy allocation still passes through
-  `_notify_reuse` before blocks are handed out. Register newly free blocks from
-  `unpin_blocks` (`:708`) with `on_free`; otherwise those blocks would count as
-  free in the queue but remain absent from the policy's allocation candidates.
-  This path is already upstream; no additional `holes/cp` commit is required
-  for this resolution.
-- Upstream `_remove_cached_block_hashes` at `block_pool.py:590` clears the
-  primary and partial hashes together. In `_maybe_evict_cached_block` (`:729`),
-  call `on_uncache` after successful removal and retain
-  `_emit_block_removed_events`, including upstream group IDs and pool medium.
-  Do not restore the fork's obsolete single-hash removal/event code.
-- Preserve upstream `free_blocks` at `block_pool.py:774`: prepend uncached
-  blocks, append cached blocks and route foreign blocks to their owning pool.
-  Collect only this pool's newly free non-null blocks, in input order, for the
-  policy hook after queue insertion. Thus policy-off queue behavior and
-  cross-pool reference accounting remain upstream, while the policy receives
-  the fork's free-notification ordering.
-- Place `on_request_free` immediately after the request block table is popped
-  in `vllm/v1/core/single_type_kv_cache_manager.py:562`. Keep physical freeing
-  in the existing caller / `free` at `:581`, avoiding a double free and retaining
-  coordinator-mediated deferred frees and previous hole-bookkeeping cleanup.
-- Retain v0.32.0 speculative metrics and connector arrival handling in
-  `vllm/v1/core/sched/scheduler.py:2616`, adding the policy arrival hook alongside
-  them. Preserve stale-output handling at `:2166`, auxiliary-output cleanup and
-  the upstream tuple return contract at `_free_request` (`:2714`). Add the fork's
-  prefill/finish notifications without replacing these paths.
-
-Checks performed:
+Verified (syntax/whitespace only): the following exact compilation command
+returned exit 0 with no diagnostics, including after the final test changes:
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/vllm-port-f935c3463b-pycache /home/asd/LLMServingSim/.wt/testenv/bin/python -I -m py_compile vllm/v1/core/block_pool.py vllm/v1/core/eviction.py vllm/v1/core/sched/scheduler.py vllm/v1/core/single_type_kv_cache_manager.py
-git diff --check HEAD -- vllm/v1/core/block_pool.py vllm/v1/core/eviction.py vllm/v1/core/sched/scheduler.py vllm/v1/core/single_type_kv_cache_manager.py
-rg -n '^(<<<<<<<|=======|>>>>>>>)' vllm/v1/core/block_pool.py vllm/v1/core/eviction.py vllm/v1/core/sched/scheduler.py vllm/v1/core/single_type_kv_cache_manager.py
+PYTHONPYCACHEPREFIX=/tmp/vllm-port-r1-pycache /home/asd/LLMServingSim/.wt/testenv/bin/python -I -m py_compile tests/v1/holes/holes_utils.py tests/v1/holes/test_holes_kv.py tests/v1/holes/test_holes_segments.py tests/v1/holes/test_rate_eviction.py vllm/config/vllm.py vllm/v1/attention/backends/msa_attn.py vllm/v1/core/eviction.py vllm/v1/core/kv_cache_manager.py vllm/v1/core/sched/scheduler.py vllm/v1/worker/gpu_model_runner.py
+git diff --check
 ```
 
-Verified results: compilation and whitespace check PASS (exit 0, no diagnostics);
-marker search exit 1 with no matches. Used the existing host test environment
-in isolated mode; no packages were installed or project modules imported.
-No tests were modified. Behavioral tests, model evaluations, GPU jobs,
-simulator runs and independent verification were not performed; the caller
-owns verification. Syntax/whitespace checks do not establish runtime correctness.
-Git's unmerged index entries remain for the master to stage and continue.
+`git diff --check` also returned exit 0 without diagnostics. Filesystem checks
+found neither torch nor vLLM in the host testenv site-packages. No project import
+was attempted. Behavioral equivalence is inferred from the adaptations, not
+verified by these checks.
 
-Questions: none for this commit. Multi-group/hybrid extensions remain a separate
-follow-up under the current decision; this resolution preserves the original
-single-group policy restriction.
+Test changes: existing assertions preserved through the API adaptations described
+above; new regressions additionally exercise explicit MSA non-causal/R-SWA and
+async-spec rejection. No test was deleted, loosened or skipped. None was run.
+
+Files changed (all under /home/asd/vllm-port):
+
+- PORT-v0.32.0.md
+- tests/v1/holes/holes_utils.py
+- tests/v1/holes/test_holes_kv.py
+- tests/v1/holes/test_holes_segments.py
+- tests/v1/holes/test_rate_eviction.py
+- vllm/config/vllm.py
+- vllm/v1/attention/backends/msa_attn.py
+- vllm/v1/core/eviction.py
+- vllm/v1/core/kv_cache_manager.py
+- vllm/v1/core/sched/scheduler.py
+- vllm/v1/worker/gpu_model_runner.py
+
+Escalations: none. Rule use: phase-1 not active. Not verified: all runtime and
+independent-review items in the could-not-check section. There are no commits
+from this call; every fix remains unstaged in the working tree for the caller.

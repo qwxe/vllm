@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """holes/core: model-runner segment view and its attention semantics (CPU)."""
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -40,6 +44,67 @@ def test_build_segments_hole_only_step():
     pos = _positions(nc, ns)
     seg = build_hole_segments(["h"], {"h": [(0, 32)]}, ns, nc, pos)
     assert seg.seg_ends.tolist() == [32] and pos.tolist() == list(range(32))
+
+
+def test_msa_uses_exact_lengths_instead_of_optimistic_cpu_bounds():
+    from vllm.v1.attention.backends.msa_attn import msa_segments
+
+    cm = SimpleNamespace(
+        num_reqs=2,
+        seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([14, 24], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 3], dtype=torch.int32),
+    )
+    segments, lengths = msa_segments(cm)
+    assert lengths.tolist() == [10, 20]
+    assert segments.tolist() == [[0, 0, 1, 9], [1, 1, 2, 18]]
+
+
+def test_msa_forward_reads_packed_kv_for_different_head_counts():
+    from vllm.v1.attention.backends.msa_attn import MsaAttentionImpl
+
+    impl = MsaAttentionImpl.__new__(MsaAttentionImpl)
+    impl.head_size = 16
+    impl.scale = 0.25
+    for heads in (1, 2, 4):
+        cache = torch.arange(2 * heads * 16 * 32).reshape(2, heads, 16, 32)
+        query = torch.zeros(1, heads, 16)
+        output = torch.empty_like(query)
+        metadata = SimpleNamespace(num_actual_tokens=1, block_table=None, plan=None)
+        with patch("vllm.v1.attention.backends.msa_attn.msa_attention") as attention:
+            result = impl.forward(None, query, None, None, cache, metadata, output)
+        _, key, value, _, _ = attention.call_args.args
+        assert result is output
+        assert key.shape == value.shape == (2, 16, heads, 16)
+        torch.testing.assert_close(key, cache[..., :16].permute(0, 2, 1, 3))
+        torch.testing.assert_close(value, cache[..., 16:].permute(0, 2, 1, 3))
+
+
+def test_msa_rejects_non_causal_and_rswa_metadata():
+    from vllm.v1.attention.backends.msa_attn import (
+        MsaAttentionBackend,
+        MsaAttentionMetadataBuilder,
+    )
+
+    builder = MsaAttentionMetadataBuilder.__new__(MsaAttentionMetadataBuilder)
+    assert not MsaAttentionBackend.supports_non_causal()
+    assert not MsaAttentionBackend.supports_rswa()
+    for causal in (False, torch.tensor([True, False])):
+        with pytest.raises(NotImplementedError, match="non-causal"):
+            builder.build(0, SimpleNamespace(causal=causal))
+    with pytest.raises(NotImplementedError, match="R-SWA"):
+        builder.build(0, SimpleNamespace(causal=True, rswa_prefix_lens=torch.tensor([1])))
+
+
+def test_msa_rejects_async_speculation_before_cuda_initialization():
+    from vllm.v1.attention.backends.msa_attn import MsaAttentionMetadataBuilder
+
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+    )
+    with pytest.raises(NotImplementedError, match="async speculative decode"):
+        MsaAttentionMetadataBuilder(None, [], config, torch.device("cpu"))
 
 
 def _varlen_causal(q, k_cache, v_cache, cu_q, seq_lens, block_table, bs):

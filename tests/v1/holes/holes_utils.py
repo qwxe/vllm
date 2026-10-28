@@ -101,7 +101,11 @@ def fake_output(sched_out, token: int = 7) -> ModelRunnerOutput:
     )
 
 
-def step(scheduler: Scheduler):
+def step(
+    scheduler: Scheduler,
+    prefill_stats: dict | None = None,
+    scheduler_stats: list | None = None,
+):
     out = scheduler.schedule()
     mro = fake_output(out)
     # Mirror the runner: discard samples of partial prefills.
@@ -109,5 +113,12 @@ def step(scheduler: Scheduler):
         req = scheduler.requests[rid]
         if req.num_computed_tokens < req.num_tokens or req.pending_hole_ranges:
             mro.sampled_token_ids[i] = []
-    scheduler.update_from_output(out, mro)
+    outputs = scheduler.update_from_output(out, mro)
+    for client_outputs in outputs.values():
+        if scheduler_stats is not None and client_outputs.scheduler_stats is not None:
+            scheduler_stats.append(client_outputs.scheduler_stats)
+        if prefill_stats is not None:
+            for output in client_outputs.outputs:
+                if output.prefill_stats is not None:
+                    prefill_stats[output.request_id] = output.prefill_stats
     return out

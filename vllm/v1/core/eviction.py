@@ -597,6 +597,9 @@ def make_eviction_policy(
 
 
 def session_id_of(request: Any) -> str | None:
+    sid = getattr(request, "session_id", None)
+    if sid is not None:
+        return str(sid)
     sp = getattr(request, "sampling_params", None)
     extra = getattr(sp, "extra_args", None) if sp is not None else None
     if isinstance(extra, dict):
