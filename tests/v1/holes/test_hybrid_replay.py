@@ -478,27 +478,23 @@ BS = 16
 PROMPT = list(range(1, 1 + 6 * BS + 7))  # 6 full pages + 7 tokens = 103
 
 
-def _hyb_runner(holes=None, num_gpu_blocks=200):
+def _hyb_runner(holes=None, num_gpu_blocks=200, kinds=("full", "swa")):
     from tests.v1.kv_connector.unit.offloading_connector.utils import RequestRunner
 
-    groups = [
-        KVCacheGroupSpec(
-            ["l0"],
-            FullAttentionSpec(
+    def spec(kind):
+        if kind == "full":
+            return FullAttentionSpec(
                 block_size=BS, num_kv_heads=1, head_size=1, dtype=torch.float32
-            ),
-        ),
-        KVCacheGroupSpec(
-            ["l1"],
-            SlidingWindowSpec(
-                block_size=BS,
-                num_kv_heads=1,
-                head_size=1,
-                dtype=torch.float32,
-                sliding_window=2 * BS,
-            ),
-        ),
-    ]
+            )
+        return SlidingWindowSpec(
+            block_size=BS,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=2 * BS,
+        )
+
+    groups = [KVCacheGroupSpec([f"l{i}"], spec(k)) for i, k in enumerate(kinds)]
     cfg = {"enabled": True, "test_hooks": True}
     cfg.update(holes or {})
     r = RequestRunner(
@@ -720,3 +716,22 @@ def test_scheduler_preempt_or_abort_mid_replay_leaves_nothing_behind():
     assert all(
         blk.ref_cnt == 0 for blk in m.block_pool.blocks if not blk.is_null
     )
+
+
+def test_scheduler_two_full_groups_of_one_spec_are_looked_up_jointly():
+    r = _hyb_runner(kinds=("full", "full"))
+    assert r.scheduler.hybrid_holes_enabled
+    _prime_runner(r)
+    s = r.scheduler
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 1)  # only the second Full group lost page 2
+    s.add_request(b)
+    out = s.schedule()
+    st = out.hybrid_replay_steps["b"]
+    assert out.scheduled_hole_ranges["b"] == [(32, 48)]
+    # groups of one spec share their hash entries: the page is a hole in both
+    # (stock joint lookup), so the replay writes it in both and nothing is
+    # retained inside the span
+    assert st.replacement_rows == {} and st.no_write == {}
+    ids = s.kv_cache_manager.get_block_ids("b")
+    assert len(ids) == 2 and len(ids[0]) == len(ids[1])
