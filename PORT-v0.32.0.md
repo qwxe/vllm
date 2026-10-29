@@ -446,7 +446,7 @@ Effective iff: manager-level support (prefix caching, supported groups, no EAGLE
 
 ### Not done (reported, not hidden)
 
-- Mamba execution (state restore into a private running state, explicit a/b in `mamba_utils`, Mamba attention metadata): the planner/residency/admission already treat Mamba groups, the scheduler gates them off.
+- (Done in Part B2, see "Part B2 Mamba execution" below) Mamba execution.
 - Stage 4: L2 Full/SWA/Mamba sources (connector hole API is single-group, `kv_group_configs[0]`), one load job over all groups, store cap for hybrid, external stats, MultiConnector.
 - GPU: only the tiny dummy-weight Full+SWA model, eager, greedy bf16; no CUDA-graph run, no real checkpoint, no TP/PP.
 
@@ -462,3 +462,12 @@ Effective iff: manager-level support (prefix caching, supported groups, no EAGLE
 - Mutation (temporary local patch, reverted, not committed): `self.positions[:total_num_scheduled_tokens] += 7` after `compute_slot_mapping` on hybrid replay steps, same command -> exit 1, `RESULT FAIL (non-vacuous)`, mismatches `[(1,restore),(1,full_hole),(1,earlier_state),(3,...x3),(5,full_hole),(5,earlier_state)]` (min logprob gaps 0-0.0078). The driver now detects a wrong replay position. The dropped-replay-write mutation was not re-run this round. Numerical equality on rescaled random weights is still a plumbing check.
 - `gpu_l2_e2e.py` prints two extra lines before the final RESULT: `RESULT C_vs_A mismatching_requests=n/N list=[...]` and `RESULT C_vs_B ...`; the final RESULT line (A criterion) is unchanged; the B line is information, no acceptance (code-r1 finding 9 is open with the user). Not re-run this round (syntax-compiled only).
 - Finding 2 (Q-A (a)): gate described in the Activation section above; test `test_hybrid_plus_l2_rate_path_stays_inert_until_stage_4` (red in 590b15016, green in b060e951c). `pytest tests/v1/holes tests/v1/kv_offload/test_cpu_rate_policy.py -p no:cacheprovider` -> 135 passed.
+
+
+### Part B2 Mamba execution (2026-10-30)
+
+- Scope: Mamba in `align` mode next to Full (and SWA) groups, V1 runner, no spec decode. The scheduler gate "Mamba state restore is not implemented yet" is removed.
+- Design: the replay execution row of a Mamba group is null everywhere except the span's last page, which holds ONE private running-state block (allocated at admission, same block id for every chunk and span of the plan, so a chunked span continues in place). A span with `span_restore` carries `state_sources[gid]=[cached boundary-state block at the span start]` and `state_dests[gid]=[private block]`; the worker copies every layer/state tensor `state[dst].copy_(state[src])` (`mamba_utils.restore_hybrid_mamba_states`) right after the stock preprocess, before the forward. Cached source blocks are protected (touched) at admission with the SWA sources and returned at the tail. A span starting at 0 has no restore (no initial state).
+- The stock `preprocess_mamba` copy follows the logical frontier, so it is skipped for requests in a replay span (`preprocess_skip_requests`, `skip_req_ids`); the tail step takes the stock path: the real rows return and the stock copy takes the cached state at the frontier C into the new last block, like a stock prefix hit (also when the last span ends exactly at C: the cached state at C is the state the planner required).
+- Defaults (II.1 vLLM/real): stock align semantics (state read from the page `(seq_len-1)//block_size`), whole-block copy equal to the stock copy with accept bias 0.
+- Receipts (RTX 4050, one process, nvidia-smi 433 MiB before): tiny dummy-weight Granite-4.0-H style config (GraniteMoeHybridForCausalLM, layers mamba/attn/mamba/attn, hybrid page 48, weights x300): `gpu_hybrid_e2e.py --kind mamba --prompts 2 --eager` exit 0 `RESULT PASS (non-vacuous)` (2 replay spans [96,144) with restore True, 2 tails); same without `--eager` (compile + graphs) exit 0 PASS; mutation (restore copy replaced by `pass`, local, reverted) exit 1 `RESULT FAIL` mismatches `[(0,'restore'), (1,'restore')]`. SWA kind re-run `--prompts 3 --eager` exit 0 PASS. Not covered on GPU: restore chunked over several steps; the "earlier_state" scenario did not replay (stock hit), CPU tests cover it.

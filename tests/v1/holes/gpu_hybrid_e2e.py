@@ -36,6 +36,39 @@ BLOCK = 16
 VOCAB = 2048
 
 
+def write_mamba_config(d: str) -> None:
+    """Tiny Granite-4.0-H style (Mamba2 + attention) hybrid, dense: layers 1
+    and 3 are attention, 0 and 2 Mamba2."""
+    cfg = {
+        "architectures": ["GraniteMoeHybridForCausalLM"],
+        "model_type": "granitemoehybrid",
+        "vocab_size": VOCAB,
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "shared_intermediate_size": 256,
+        "num_local_experts": 0,
+        "num_experts_per_tok": 0,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 2048,
+        "rms_norm_eps": 1e-5,
+        "tie_word_embeddings": False,
+        "torch_dtype": "bfloat16",
+        "layer_types": ["mamba", "attention", "mamba", "attention"],
+        "position_embedding_type": "nope",
+        "mamba_n_heads": 8,
+        "mamba_d_head": 32,
+        "mamba_n_groups": 1,
+        "mamba_d_state": 16,
+        "mamba_d_conv": 4,
+        "mamba_expand": 2,
+        "mamba_chunk_size": 16,
+    }
+    with open(os.path.join(d, "config.json"), "w") as f:
+        json.dump(cfg, f)
+
+
 def write_config(d: str) -> None:
     cfg = {
         "architectures": ["LlamaForCausalLM"],
@@ -64,10 +97,13 @@ def write_config(d: str) -> None:
         json.dump(cfg, f)
 
 
-def make_prompts(n: int, seed: int) -> list[list[int]]:
+MAMBA_UNIT = 48  # the hybrid page size of the tiny Granite-H config (checked at run time)
+
+
+def make_prompts(n: int, seed: int, unit: int = BLOCK, pages: int = 8) -> list[list[int]]:
     rng = random.Random(seed)
     return [
-        [rng.randrange(10, VOCAB) for _ in range(8 * BLOCK + rng.randrange(1, 12))]
+        [rng.randrange(10, VOCAB) for _ in range(pages * unit + rng.randrange(1, 12))]
         for _ in range(n)
     ]
 
@@ -78,7 +114,7 @@ def run_arm(args) -> int:
     from vllm.inputs import TokensPrompt
 
     model_dir = tempfile.mkdtemp(prefix="tiny_hybrid_")
-    write_config(model_dir)
+    (write_mamba_config if args.kind == "mamba" else write_config)(model_dir)
     hybrid = args.arm == "H"
     add = {"holes": {"enabled": True, "test_hooks": True}} if hybrid else {}
     ktc = None
@@ -102,7 +138,7 @@ def run_arm(args) -> int:
         load_format="dummy",
         dtype="bfloat16",
         max_model_len=1024,
-        max_num_batched_tokens=32,  # chunked prefill: SWA windows materialize at chunk ends
+        max_num_batched_tokens=MAMBA_UNIT if args.kind == "mamba" else 32,  # chunked prefill: SWA windows materialize at chunk ends
         max_num_seqs=1,
         gpu_memory_utilization=0.2,
         enable_prefix_caching=True,
@@ -110,6 +146,7 @@ def run_arm(args) -> int:
         seed=0,
         block_size=BLOCK,
         additional_config=add,
+        **({"mamba_cache_mode": "align"} if args.kind == "mamba" else {}),
         kv_transfer_config=ktc,
     )
     sched = llm.llm_engine.engine_core.engine_core.scheduler
@@ -152,16 +189,18 @@ def run_arm(args) -> int:
         from vllm.v1.core.kv_cache_utils import (
             get_request_block_hasher,
             make_block_hash_with_group_id,
+            resolve_block_hashes,
         )
         from vllm.v1.request import Request
 
         cc = sched.vllm_config.cache_config
+        hbs = sched.kv_cache_manager.coordinator.hash_block_size
         hasher = get_request_block_hasher(
-            BLOCK, get_hash_fn_by_name(cc.prefix_caching_hash_algo)
+            hbs, get_hash_fn_by_name(cc.prefix_caching_hash_algo)
         )
         kinds = sched.kv_cache_manager.coordinator.hybrid_kinds
         full_gid = kinds.index("full")
-        swa_gid = kinds.index("swa")
+        swa_gid = kinds.index("mamba" if args.kind == "mamba" else "swa")
         cache = sched.kv_cache_manager.block_pool.cached_block_hash_to_block._cache
 
         def evict(prompt, pages_gids):
@@ -173,7 +212,9 @@ def run_arm(args) -> int:
                 block_hasher=hasher,
             )
             for page, gid in pages_gids:
-                cache.pop(make_block_hash_with_group_id(r.block_hashes[page], gid), None)
+                bs = sched.kv_cache_manager.coordinator.single_type_managers[gid].block_size
+                h = resolve_block_hashes(r.block_hashes, hbs, bs)[page]
+                cache.pop(make_block_hash_with_group_id(h, gid), None)
             res = sched.kv_cache_manager.coordinator.hybrid_residency(
                 r.block_hashes, r.num_tokens
             )
@@ -181,9 +222,28 @@ def run_arm(args) -> int:
 
     sp = SamplingParams(temperature=0.0, max_tokens=12, ignore_eos=True, logprobs=2)
     recs = []
-    for i, prompt in enumerate(make_prompts(args.prompts, 7)):
+    mamba = args.kind == "mamba"
+    if hybrid and mamba:
+        sizes = [m.block_size for m in sched.kv_cache_manager.coordinator.single_type_managers]
+        assert set(sizes) == {MAMBA_UNIT}, f"group block sizes {sizes}"
+    prompts = make_prompts(args.prompts, 7, MAMBA_UNIT, 4) if mamba else make_prompts(args.prompts, 7)
+    for i, prompt in enumerate(prompts):
         runs = [("fresh", [])]
-        if hybrid:
+        if hybrid and mamba:
+            # chunked prefill (budget = one page) leaves a Mamba state at every
+            # page boundary: restore from 48, and from 48 across a lost state
+            # (Mamba align keeps only the last-prompt-boundary state: a short
+            # request ending after page 2 leaves the state at 96 to restore from)
+            llm.generate(
+                [TokensPrompt(prompt_token_ids=prompt[: 2 * MAMBA_UNIT + 1])],
+                SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+                use_tqdm=False,
+            )
+            runs += [
+                ("restore", [(2, full_gid)]),
+                ("earlier_state", [(3, full_gid), (1, swa_gid)]),
+            ]
+        elif hybrid:
             # a short request that ends exactly on page 2 leaves a retained SWA
             # window at 32, the state a replay can restore from
             llm.generate(
@@ -198,7 +258,7 @@ def run_arm(args) -> int:
             ]
         for tag, ev in runs:
             if hybrid and ev:
-                if tag != "restore":
+                if tag != "restore" or mamba:
                     llm.generate(
                         [TokensPrompt(prompt_token_ids=prompt)], sp, use_tqdm=False
                     )  # (re)fill the GPU cache of every page
@@ -219,6 +279,7 @@ def run_arm(args) -> int:
         json.dump({"arm": args.arm, "counters": counters, "steps": step_log,
                    "requests": recs}, f)
     print(f"arm={args.arm} counters={counters}", flush=True)
+    print("CACHED", [(r["prompt_idx"], r["tag"], r["cached"]) for r in recs], flush=True)
     return 0
 
 
@@ -228,6 +289,7 @@ def main() -> int:
     ap.add_argument("--out")
     ap.add_argument("--prompts", type=int, default=6)
     ap.add_argument("--eager", action="store_true")
+    ap.add_argument("--kind", choices=["swa", "mamba"], default="swa")
     ap.add_argument("--weight-scale", type=float, default=300.0,
                     help="multiply the dummy weights (+-1e-3) by this; 1 = unscaled")
     args = ap.parse_args()
@@ -239,7 +301,7 @@ def main() -> int:
         outs[arm] = os.path.join(tmp, f"{arm}.json")
         cmd = [sys.executable, os.path.abspath(__file__), "--arm", arm,
                "--out", outs[arm], "--prompts", str(args.prompts),
-               "--weight-scale", str(args.weight_scale)]
+               "--weight-scale", str(args.weight_scale), "--kind", args.kind]
         if args.eager:
             cmd.append("--eager")
         rc = subprocess.run(cmd).returncode
@@ -254,7 +316,7 @@ def main() -> int:
         if r["out"] != ref[r["prompt_idx"]]
     ]
     c = h["counters"]
-    nonvacuous = c["replay_spans"] > 0 and c["no_write_tokens"] > 0
+    nonvacuous = c["replay_spans"] > 0 and (c["no_write_tokens"] > 0 or args.kind == "mamba")
     print(f"counters={c} mismatches={bad}")
     print("steps (start, end, restore, no_write):", h.get("steps"))
     ok = not bad and nonvacuous
