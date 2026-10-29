@@ -308,6 +308,13 @@ def main():
             if c["loaded_hole_admissions"] == 0:
                 print("  C: no admission with an L2 range loaded and a recomputed hole")
                 ok = False
+    # Reference for arm C is an open question (code-r1 finding 9: A or B):
+    # report C against both, claim no acceptance from the B line.
+    bad_a = [i for i, (a, c) in enumerate(zip(recs, res["C"]["requests"])) if a["out"] != c["out"]]
+    bad_b = [i for i, (b, c) in enumerate(zip(res["B"]["requests"], res["C"]["requests"]))
+             if b["out"] != c["out"]]
+    print(f"RESULT C_vs_A mismatching_requests={len(bad_a)}/{len(recs)} list={bad_a}")
+    print(f"RESULT C_vs_B mismatching_requests={len(bad_b)}/{len(recs)} list={bad_b}")
     print("RESULT", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

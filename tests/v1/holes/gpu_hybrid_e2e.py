@@ -113,6 +113,20 @@ def run_arm(args) -> int:
         kv_transfer_config=ktc,
     )
     sched = llm.llm_engine.engine_core.engine_core.scheduler
+    if args.weight_scale != 1.0:
+        # Dummy weights are uniform +-1e-3: logits are then so flat that a wrong
+        # replay position or missing replay KV does not change greedy tokens
+        # (code-r1 finding 10). Rescale in place (same addresses, so graphs stay
+        # valid) in both arms; test-side only.
+        core = llm.llm_engine.engine_core.engine_core
+        model = core.model_executor.driver_worker.worker.model_runner.model
+        import torch
+
+        with torch.no_grad():
+            for prm in model.parameters():
+                if prm.is_floating_point():
+                    prm.mul_(args.weight_scale)
+        torch.cuda.synchronize()
     counters = {"replay_spans": 0, "replay_tokens": 0, "no_write_tokens": 0, "tails": 0}
     step_log = []
     if hybrid:
@@ -214,6 +228,8 @@ def main() -> int:
     ap.add_argument("--out")
     ap.add_argument("--prompts", type=int, default=6)
     ap.add_argument("--eager", action="store_true")
+    ap.add_argument("--weight-scale", type=float, default=300.0,
+                    help="multiply the dummy weights (+-1e-3) by this; 1 = unscaled")
     args = ap.parse_args()
     if args.arm:
         return run_arm(args)
@@ -222,7 +238,8 @@ def main() -> int:
     for arm in ("R", "H"):
         outs[arm] = os.path.join(tmp, f"{arm}.json")
         cmd = [sys.executable, os.path.abspath(__file__), "--arm", arm,
-               "--out", outs[arm], "--prompts", str(args.prompts)]
+               "--out", outs[arm], "--prompts", str(args.prompts),
+               "--weight-scale", str(args.weight_scale)]
         if args.eager:
             cmd.append("--eager")
         rc = subprocess.run(cmd).returncode
