@@ -321,6 +321,30 @@ def test_t12_completion_caches_only_loaded_ranges_and_failure_makes_holes():
     assert b.pending_load_ranges == []
 
 
+def test_t12_failed_async_load_goes_through_the_load_failed_completion_branch():
+    """Real flow: _handle_invalid_blocks marks the request in
+    failed_recving_kv_req_ids; completion must still cache only the surviving
+    loaded ranges, clear pending_load_ranges and keep the failed range a hole
+    (L 8.2 completion branch + edit 3)."""
+    r, a, b = _park_setup()
+    s = r.scheduler
+    _estep(r, complete=False)
+    blocks = s.kv_cache_manager.get_blocks("b").blocks[0]
+    s.recompute_kv_load_failures = True
+    s.kv_holding_waiting.add_request(b)
+    s._handle_invalid_blocks({blocks[0].block_id}, {})
+    assert "b" in s.failed_recving_kv_req_ids
+    assert b.pending_hole_ranges == [(0, 2 * BS)]
+    assert b.pending_load_ranges == [(2 * BS, 3 * BS)]
+    s.finished_recving_kv_req_ids.add("b")
+    s._update_waiting_for_remote_kv(b)
+    assert [x.block_hash is not None for x in blocks[:4]] == [False, False, True, True]
+    assert b.pending_load_ranges == []
+    assert b.pending_hole_ranges == [(0, 2 * BS)]
+    assert b.num_computed_tokens == 4 * BS
+    assert "b" not in s.failed_recving_kv_req_ids
+
+
 def test_t12_resume_plans_the_hole_without_a_second_lookup():
     r, a, b = _park_setup()
     s = r.scheduler
