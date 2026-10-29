@@ -1841,9 +1841,10 @@ class Scheduler(SchedulerInterface):
         """holes/M: the shared capability result for hybrid (multi-group)
         holes. Needs the manager-level support, the V1 runner, no EAGLE, Full
         and sliding-window groups only (Mamba state restore is not wired
-        yet) and the L2 rate connector (no connector = no hybrid holes, M
-        note U4; ``holes.test_hooks`` lifts the connector requirement for
-        CPU tests only)."""
+        yet) and no connector (no connector = no hybrid holes, M note U4;
+        ``holes.test_hooks`` lifts that requirement for CPU tests only). The
+        L2 rate connector path stays gated off until stage 4 (Q-A (a));
+        ``test_hooks`` lifts that too, for the CPU tests."""
         kvm = self.kv_cache_manager
         if not kvm.hybrid_holes_enabled:
             return False
@@ -1871,6 +1872,14 @@ class Scheduler(SchedulerInterface):
             )
             if not allowed:
                 reason = why
+            elif not self.hole_config.test_hooks:
+                # Q-A (a) (code-r1 finding 2): the hybrid lookup bypasses
+                # the connector's L2 lookup until stage 4 (L2 sources) exists;
+                # stay on the stock path, never worse than stock (M 7.2).
+                reason = (
+                    "hybrid holes with the L2 offload connector wait for "
+                    "stage 4 (L2 hybrid sources); using the stock lookup."
+                )
         if reason:
             logger.warning("Hybrid holes disabled: %s", reason)
             return False

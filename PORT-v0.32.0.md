@@ -433,7 +433,7 @@ Scope: note r7 section 9 stage 3 (the M prerequisite) for **Full + sliding-windo
 
 ### Activation (scheduler `_hybrid_holes_effective`)
 
-Effective iff: manager-level support (prefix caching, supported groups, no EAGLE/DCP/PCP) AND V1 runner AND no Mamba group (not wired yet; one warning, stock lookup) AND the CPU offload connector with `eviction_policy="rate"` is present (M note U4: no connector = no hybrid holes; `holes.test_hooks` lifts only this connector requirement, for CPU tests) AND `connector_allows_holes` (Part A table). NIXL, Mooncake and MultiConnector stay off [dep MC].
+Effective iff: manager-level support (prefix caching, supported groups, no EAGLE/DCP/PCP) AND V1 runner AND no Mamba group (not wired yet; one warning, stock lookup) AND the CPU offload connector with `eviction_policy="rate"` passes `connector_allows_holes` (Part A table) BUT the hybrid + L2 path stays inert (one `logger.warning`, stock lookup incl. the connector's lookup) until stage 4 exists [fix round 2, Q-A (a), master 2026-10-30; code-r1 finding 2; M 7.2 never worse than stock]. Without a connector, hybrid holes are effective only under `holes.test_hooks`, which also lifts the stage-4 gate (CPU tests only; M note U4). In practice hybrid holes are therefore not effective in production configs until stage 4. NIXL, Mooncake and MultiConnector stay off [dep MC].
 
 ### Defaults and implementation choices (II.1 "Defaults: vLLM or real deployments")
 
