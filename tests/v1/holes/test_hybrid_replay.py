@@ -134,3 +134,51 @@ def test_unsupported_combinations_have_reason():
     assert kinds is None and "align" in reason
     kinds, reason = _kinds("full", "rswa")
     assert kinds is None and "RSWAManager" in reason
+
+
+# ---- checked full-row replacement in the worker block table (M section 6) --
+
+
+def _tables():
+    import torch
+
+    from vllm.v1.worker.block_table import MultiGroupBlockTable
+    from vllm.v1.worker.block_table import SlotMappingMode
+
+    return MultiGroupBlockTable(
+        max_num_reqs=2,
+        max_num_batched_tokens=64,
+        pin_memory=False,
+        device=torch.device("cpu"),
+        block_sizes=[16, 32],
+        max_num_blocks=[8, 8],
+        slot_mapping_modes=[SlotMappingMode.TOKEN_TO_KV_SLOT] * 2,
+    )
+
+
+def test_replace_row_interior_and_shrink_clears_tail():
+    t = _tables()
+    t.add_row(([1, 2, 3, 4, 5], [10, 11, 12]), 0)
+    t.add_row(([7, 8], [20]), 1)
+    # group 1 replaced by a shorter row, group 0 left alone (None)
+    t.replace_row((None, [30, 31]), 0)
+    g0, g1 = t.block_tables
+    assert list(g0.block_table.np[0, :5]) == [1, 2, 3, 4, 5]
+    assert g1.num_blocks_per_row[0] == 2
+    assert list(g1.block_table.np[0, :4]) == [30, 31, 0, 0]  # stale cell 12 cleared
+    # interior replacement keeps the length
+    t.replace_row(([1, 9, 3, 4, 5], None), 0)
+    assert list(g0.block_table.np[0, :5]) == [1, 9, 3, 4, 5]
+    # other row untouched
+    assert list(g0.block_table.np[1, :2]) == [7, 8]
+    assert list(g1.block_table.np[1, :1]) == [20]
+
+
+def test_replace_row_rejects_overlong_row():
+    import pytest
+
+    t = _tables()
+    t.add_row(([1], [1]), 0)
+    width = t.block_tables[0].max_num_blocks_per_req
+    with pytest.raises(ValueError):
+        t.replace_row((list(range(width + 1)), None), 0)
