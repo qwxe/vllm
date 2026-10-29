@@ -174,3 +174,37 @@ def segment_common_attn_metadata(cm, seg: HoleSegments, device: torch.device):
         replayssm_decode_base_cpu=select_rows(cm.replayssm_decode_base_cpu),
         hole_segments=seg,
     )
+
+
+def apply_hybrid_replay_rows(input_batch, steps) -> None:
+    """holes/M: install the complete replacement rows of this step's hybrid
+    replay steps. The association is the request id, resolved against the
+    current batch (rows move on condense); a step of a request that is not in
+    the batch is ignored, never applied to the row's new owner."""
+    num_groups = len(input_batch.block_table.block_tables)
+    for req_id, step in steps.items():
+        row = input_batch.req_id_to_index.get(req_id)
+        if row is None or not step.replacement_rows:
+            continue
+        ids = tuple(step.replacement_rows.get(g) for g in range(num_groups))
+        input_batch.block_table.replace_row(ids, row)
+
+
+def hybrid_write_suppress_indices(
+    steps, req_ids: list[str], query_start_loc: np.ndarray
+) -> dict[int, np.ndarray]:
+    """holes/M: flattened-batch token indices, per KV cache group, whose cache
+    writes must be dropped (the cells are retained, shared and cached). The
+    step's span is laid out contiguously from its query start."""
+    out: dict[int, list[np.ndarray]] = {}
+    for i, req_id in enumerate(req_ids):
+        step = steps.get(req_id)
+        if step is None or not step.no_write:
+            continue
+        qs = int(query_start_loc[i])
+        for gid, ranges in step.no_write.items():
+            for s, e in ranges:
+                out.setdefault(gid, []).append(
+                    np.arange(qs + s - step.start, qs + e - step.start)
+                )
+    return {g: np.concatenate(v) for g, v in out.items()}
