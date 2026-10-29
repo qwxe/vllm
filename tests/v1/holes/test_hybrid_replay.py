@@ -478,7 +478,9 @@ BS = 16
 PROMPT = list(range(1, 1 + 6 * BS + 7))  # 6 full pages + 7 tokens = 103
 
 
-def _hyb_runner(holes=None, num_gpu_blocks=200, kinds=("full", "swa")):
+def _hyb_runner(
+    holes=None, num_gpu_blocks=200, kinds=("full", "swa"), async_scheduling=False
+):
     from tests.v1.kv_connector.unit.offloading_connector.utils import RequestRunner
 
     def spec(kind):
@@ -501,7 +503,7 @@ def _hyb_runner(holes=None, num_gpu_blocks=200, kinds=("full", "swa")):
         block_size=BS,
         num_gpu_blocks=num_gpu_blocks,
         kv_cache_groups=groups,
-        async_scheduling=False,
+        async_scheduling=async_scheduling,
         additional_config={"holes": cfg},
         extra_config_overrides={"eviction_policy": "rate"},
     )
@@ -735,3 +737,30 @@ def test_scheduler_two_full_groups_of_one_spec_are_looked_up_jointly():
     assert st.replacement_rows == {} and st.no_write == {}
     ids = s.kv_cache_manager.get_block_ids("b")
     assert len(ids) == 2 and len(ids[0]) == len(ids[1])
+
+
+def test_async_scheduler_fence_and_no_placeholders_during_replay():
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+    r = _hyb_runner(async_scheduling=True)
+    s = r.scheduler
+    assert isinstance(s, AsyncScheduler)
+    # prime without the sync helper: step until the request is gone
+    a = U.make_request("a", PROMPT)
+    s.add_request(a)
+    while "a" in s.requests:
+        _estep(r)
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    s.add_request(b)
+    o1 = s.schedule()
+    assert o1.hybrid_replay_steps["b"].end == 48
+    rb = s.requests["b"]
+    assert rb.num_output_placeholders == 0  # a replay step samples nothing
+    o2 = s.schedule()  # output of o1 not processed yet
+    assert "b" not in o2.num_scheduled_tokens
+    _out(s, o1)
+    assert rb.hybrid_step_pending is False
+    o3 = s.schedule()
+    assert o3.num_scheduled_tokens["b"] == 7
+    assert o3.hybrid_replay_steps["b"].end == o3.hybrid_replay_steps["b"].start
