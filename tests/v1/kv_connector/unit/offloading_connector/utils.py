@@ -184,6 +184,7 @@ class RequestRunner:
         worker_count: int = 1,
         retention_interval: int | None = None,
         speculative_config: Any | None = None,
+        additional_config: dict[str, Any] | None = None,
     ):
         assert blocks_per_chunk == 1 or kv_cache_groups is None, (
             "blocks_per_chunk > 1 requires all groups to have the same "
@@ -207,6 +208,8 @@ class RequestRunner:
         vllm_config.cache_config.prefix_cache_retention_interval = retention_interval
         if speculative_config is not None:
             vllm_config.speculative_config = speculative_config
+        if additional_config is not None:
+            vllm_config.additional_config = additional_config
 
         extra_config: dict[str, Any] = {
             "spec_name": "MockOffloadingSpec",
