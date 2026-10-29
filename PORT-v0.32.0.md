@@ -390,3 +390,25 @@ the retry to insert without a second `on_store_miss`; the L table row 5.1 says i
 at each `evict` call from persistent parent/anchor links (correct, O(keys) per call, not the lazy heap of L 6.2);
 `chunk_tokens` and `policy` in the nested `rate` dict are rejected explicitly in the spec because
 `EvictionConfig` has the `chunk_tokens` field.
+
+Receipts (RTX 4050 Laptop 6 GB, venv /home/asd/vllm-port-venv; pristine = `git archive d7307d8ea` with the compiled `.so` files
+copied, run with `PYTHONPATH`; final = this branch):
+
+- `tests/v1/holes`: pristine 43 passed; final 69 passed (the 43 unchanged plus 26 new in `test_l2_holes.py`; 18 more in
+  `tests/v1/kv_offload/test_cpu_rate_policy.py`).
+- `tests/v1/core` (whole directory): pristine and final fail/error the same 5 + 4 tests (structured-output FSM abort,
+  reset-prefix-cache e2e, PP placeholders, diffusion deferral, two e2e fixtures); no pass-to-fail change.
+- `tests/v1/kv_connector/unit` (whole directory, run before the MultiConnector fix commit): pristine 18 failed / 15 errors,
+  final 19 failed / 0 errors; the one new failure, `test_multi_connector_overrides_all_base_methods`, is fixed by the
+  explicit `MultiConnector.on_prefill_done` no-op (file re-run: 29 passed, 1 failed = pre-existing
+  `test_multi_example_connector_consistency`). The 15 pristine errors did not recur (not investigated).
+- `tests/v1/kv_offload`, one pytest process per file: identical counts in pristine and final (only
+  `cpu/test_canonical_layout.py` 4 failed / 3 errors, pre-existing); the whole-directory run cascades into errors after
+  `cpu/test_gpu_worker.py` in both trees and is not used.
+- `HOLES_MODEL=Qwen/Qwen2.5-0.5B-Instruct python tests/v1/holes/gpu_l2_e2e.py --eager` (seed 1234, 24 sessions, 108
+  requests, GPU pool 184 blocks, CPU pool 1/3 of 1946 chunks; synthetic workload, no claim about real traces): exit 1,
+  `RESULT FAIL` because C is not token-identical to A on 5 of 108 requests, all near-ties (A top1-top2 logprob gap
+  0.000-0.125 at the first differing token) that the holes-off arms B (6 requests) and D (7 requests) show on the same
+  requests (no cached prefix or a different split of it), i.e. bf16 prefill-shape noise and not a holes effect; non-vacuity
+  holds: C scheduled 8 hole steps (4240 hole tokens) with 8 admissions that loaded L2 ranges and recomputed a hole, 1515 L2
+  evictions. Per the note a near-tie is not a pass; the verdict is left to the reviewer.
