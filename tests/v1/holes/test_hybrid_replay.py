@@ -786,3 +786,11 @@ def test_scheduler_protects_sources_before_the_first_allocation():
     s.add_request(b)
     s.schedule()
     assert all(c >= 1 for c in seen["refs"]), seen
+
+
+def test_connector_hands_the_swa_window_width_to_the_manager():
+    r = _hyb_runner()
+    # sliding_window = 2 pages, chunk = 1 page -> 2 chunks, group 1
+    r.manager.set_group_windows.assert_called_once_with({1: 2})
+    r2 = _hyb_runner(kinds=("full", "full"))
+    r2.manager.set_group_windows.assert_not_called()

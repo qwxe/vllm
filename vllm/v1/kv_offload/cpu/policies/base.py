@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ctypes
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 
@@ -132,6 +132,11 @@ class CachePolicy(ABC):
 
         Ghost lists and adaptive state are also reset.
         """
+
+    def set_group_windows(self, window_chunks: Mapping[int, int]) -> None:
+        """holes: sliding-window width in chunks per "swa" group. Default:
+        ignored."""
+        return
 
     def set_group_kinds(self, kinds: Sequence[str], min_reuse_blocks: int) -> None:
         """holes: group kinds ("full"/"swa"/"mamba") and the hole config's

@@ -139,6 +139,9 @@ class RateCachePolicy(CachePolicy):
         self.readers: dict[OffloadKey, set[str]] = defaultdict(set)
         self.owned: dict[str, set[OffloadKey]] = defaultdict(set)
 
+    def set_group_windows(self, window_chunks: Mapping[int, int]) -> None:
+        self.group_window_chunks.update(window_chunks)
+
     def set_group_kinds(self, kinds: Sequence[str], min_reuse_blocks: int) -> None:
         self.kinds = list(kinds)
         self.min_reuse = max(1, int(min_reuse_blocks))

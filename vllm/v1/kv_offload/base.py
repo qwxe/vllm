@@ -3,7 +3,7 @@
 """Core abstractions for KV cache offloading in vLLM v1."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, NewType, TypeVar
@@ -414,6 +414,12 @@ class OffloadingManager(ABC):
     def on_prefill_done(self, req_context: ReqContext) -> None:
         """Called once when the request's prefill finished (its first non-empty
         sampled tokens). Default: ignored."""
+        return
+
+    def set_group_windows(self, window_chunks: Mapping[int, int]) -> None:
+        """holes: width in chunks of the sliding window of every "swa" KV cache
+        group (group id -> chunks), handed over once after ``set_group_kinds``.
+        Default: ignored."""
         return
 
     def set_group_kinds(self, kinds: Sequence[str], min_reuse_blocks: int) -> None:

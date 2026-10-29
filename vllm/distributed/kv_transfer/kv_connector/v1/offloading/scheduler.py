@@ -589,6 +589,14 @@ class OffloadingConnectorScheduler:
             ],
             get_hole_config(vllm_config).min_reuse_blocks,
         )
+        windows = {
+            g.group_idx: g.sliding_window_size_in_chunks
+            for g in self.config.kv_group_configs
+            if isinstance(g.kv_cache_spec, SlidingWindowSpec)
+            and g.sliding_window_size_in_chunks is not None
+        }
+        if windows:
+            self.manager.set_group_windows(windows)
         self._connector_stats = OffloadingConnectorStats()
 
         full_attention_groups: list[int] = []

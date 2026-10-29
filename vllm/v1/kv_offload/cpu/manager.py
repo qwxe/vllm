@@ -198,6 +198,10 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.on_prefill_done(req_context)
 
     @override
+    def set_group_windows(self, window_chunks: Mapping[int, int]) -> None:
+        self._policy.set_group_windows(window_chunks)
+
+    @override
     def set_group_kinds(self, kinds: Sequence[str], min_reuse_blocks: int) -> None:
         self._policy.set_group_kinds(kinds, min_reuse_blocks)
 
