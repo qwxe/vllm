@@ -480,6 +480,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.on_new_request(request)
 
+    def on_prefill_done(self, request: "Request") -> None:
+        # holes/L2 [dep MC]: not forwarded until the user decides how an
+        # OffloadingConnector with eviction_policy="rate" may live inside a
+        # MultiConnector (holes stay off for MultiConnector).
+        return
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> MultiKVConnectorMetadata:

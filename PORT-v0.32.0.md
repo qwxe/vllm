@@ -353,3 +353,40 @@ Results on the RTX 4050 (Qwen/Qwen2.5-0.5B-Instruct rev 7ae557604adf67be50417f59
   tokens_equal 12/12, 6 holed requests, 4864 hole tokens, holed cached [1712, 1456, 1424, 1168, 1392, 1136].
   Logs: /home/asd/dl-overnight/logs/test-adapt/ (onoff-r1.log: exit 1 recorded; onoff-s2t6-{1,2}.log: no exit line;
   onoff-r1-final.log: exit 0 recorded).
+
+## holes-v2 Part A: holes at L2 (CPU OffloadingConnector, `rate` policy) — T20261029-holes-v2-impl2
+
+Branch `port/v0.32.0/holes-v2`, base `d7307d8ea`. Design: `notes/design/T20261029-holes-v2.md` r7 section 9 stages 1-2
+and L note `T20261028-fork-l2-rate` r5 commits 1-5 (single group, Full attention only). Commit pairs are a failing test
+commit followed by the behaviour commit.
+
+| Stage / L commit | What | Files |
+|---|---|---|
+| 1 | `min_reuse_blocks` and group kinds handed to the offload manager once, after `spec.get_manager()` (`OffloadingManager.set_group_kinds`, default no-op; stock policies ignore it) | `kv_offload/base.py`, `offloading/scheduler.py` |
+| L1 | `RateCachePolicy` (`eviction_policy="rate"`, nested `rate` dict; `running_owner="decode"`, `rescore_s=0`), registered in the factory; hooks `on_request_arrival`, `on_prefill_done`, `set_group_kinds`; `ReqContext.session_id`; spec validation as `ValueError` | `kv_offload/cpu/policies/{rate,base,factory}.py`, `cpu/{manager,spec}.py`, `kv_offload/base.py` |
+| L2 | `_create_req_context` carries the session id; `KVConnectorBase_V1.on_prefill_done` (default no-op), forwarded by `OffloadingConnector`, once per request from `Scheduler.update_from_output` at the first non-empty sampled tokens | `offloading/scheduler.py`, `offloading_connector.py`, `v1/base.py`, `sched/scheduler.py` |
+| L3 | activation gate `connector_allows_holes` (shared by the scheduler): no connector or a mask connector as before; the CPU OffloadingConnector only with `eviction_policy="rate"`; MultiConnector, NIXL, Mooncake stay off [dep MC] | `hole_mask.py`, `sched/scheduler.py` |
+| L4 | `OffloadingConnector` implements `SupportsBlockHitMask`; async range load: the request parks in WAITING_FOR_REMOTE_KVS with `pending_hole_ranges` and `pending_load_ranges`, only the loaded ranges are cached on completion, failed blocks turn into holes, resume plans the hole from the frontier without a new lookup; store offers are capped at the contiguous computed range (running and abort branches); `ValueError` for `blocks_per_chunk != 1` whenever holes are configured | `offloading_connector.py`, `offloading/scheduler.py`, `sched/scheduler.py`, `v1/request.py` |
+| L5 | `tests/v1/holes/gpu_l2_e2e.py`: synthetic seeded workload, arms A-D | `tests/v1/holes/` |
+
+Activation table (`connector_allows_holes`, tested by `test_t11_*`):
+
+| Connector | `eviction_policy` | Holes |
+|---|---|---|
+| none | - | on (existing GPU path, unchanged) |
+| other `SupportsBlockHitMask` connector | - | on (unchanged; async masks still treated as misses) |
+| `OffloadingConnector` | `rate` | on |
+| `OffloadingConnector` | `lru`, `arc` or absent | off with a warning (holes + LRU is not a configuration) |
+| MultiConnector, NIXL, Mooncake (no mask API) | - | off [dep MC] |
+
+Carried placeholders (nothing decided here): [dep U2] one chunk is one front unit (no 256-token bucket below the chunk);
+[dep Q5] rates are computed lazily at every `evict` call (the per-node update table of L 5.1 is not mirrored by eager
+re-scoring); [dep MC] MultiConnector inside `rate` is unsupported and not used by any test or arm; H needs no code.
+The SWA window width of the closure oracle defaults to one chunk until Part B supplies `sliding_window_size_in_chunks`
+(`policy_config["group_window_chunks"]`).
+
+Local choices (I.10, stated for the reviewer): on a failed store the policy keeps the pending metadata (T5 requires
+the retry to insert without a second `on_store_miss`; the L table row 5.1 says it is dropped); the node tree is rebuilt
+at each `evict` call from persistent parent/anchor links (correct, O(keys) per call, not the lazy heap of L 6.2);
+`chunk_tokens` and `policy` in the nested `rate` dict are rejected explicitly in the spec because
+`EvictionConfig` has the `chunk_tokens` field.
