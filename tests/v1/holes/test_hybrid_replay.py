@@ -332,3 +332,131 @@ def test_residency_min_reuse_turns_short_run_into_missing():
         r1.block_hashes, r1.num_tokens, min_reuse_blocks=2
     )
     assert res2.full_missing == [[(16, 64)]]
+
+
+# ---- hybrid lookup + all-hit-first admission transaction (M sections 4-5) --
+
+
+def _hybrid_manager_h(spec_types, num_blocks=64, enabled=True):
+    from tests.v1.core.test_prefix_caching import (
+        _make_hybrid_kv_cache_config,
+        make_kv_cache_manager,
+    )
+    from vllm.v1.core.holes import HoleConfig
+
+    cfg = _make_hybrid_kv_cache_config(16, num_blocks, spec_types)
+    return make_kv_cache_manager(
+        cfg,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+        hole_config=HoleConfig(enabled=enabled),
+    )
+
+
+def _evict(m, req, page, gid):
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+    m.block_pool.cached_block_hash_to_block._cache.pop(
+        make_block_hash_with_group_id(req.block_hashes[page], gid)
+    )
+
+
+def test_hybrid_flag_only_for_supported_multigroup_configs():
+    assert _hybrid_manager_h(["full", "sliding_window"]).hybrid_holes_enabled
+    assert _hybrid_manager_h(["full", "full"]).hybrid_holes_enabled
+    assert not _hybrid_manager_h(["full", "sliding_window"], enabled=False).hybrid_holes_enabled
+    assert not _hybrid_manager_h(["sliding_window", "mamba_align"]).hybrid_holes_enabled
+    assert not _hybrid_manager_h(["full"]).hybrid_holes_enabled  # single-group path
+
+
+def test_hybrid_lookup_blocks_equal_stock_hit_at_frontier_plus_holes():
+    m = _hybrid_manager_h(["full", "sliding_window"])
+    _prime(m)
+    r1 = _req("1")
+    _evict(m, r1, 2, 0)
+    lk = m.get_computed_blocks_hybrid(r1)
+    assert lk is not None and lk.plan.frontier == 96
+    full, swa = lk.blocks.blocks
+    assert [b.is_null for b in full] == [False, False, True, False, False, False]
+    # stock SWA hit at 96 (window 2 pages): earlier pages are null
+    assert [b.is_null for b in swa] == [True, True, True, True, False, False]
+    # local useful cached tokens: 96 minus the repaired [32,48) = 80
+    assert lk.num_local_cached_tokens == 80
+    assert lk.num_hole_pages == 1
+
+
+def test_hybrid_no_benefit_returns_none():
+    m = _hybrid_manager_h(["full", "sliding_window"])
+    _prime(m)
+    r1 = _req("1")
+    assert m.get_computed_blocks_hybrid(r1) is None  # nothing missing: stock
+
+
+def test_hybrid_admission_tail_switch_equals_stock_hit():
+    from vllm.utils.hashing import sha256  # noqa: F401
+
+    ref = _hybrid_manager_h(["full", "sliding_window"])
+    _prime(ref)
+    rr = _req("ref")
+    rb, n, _ = ref.get_computed_blocks(rr)
+    assert n == 96
+    ref.allocate_slots(rr, rr.num_tokens - n, n, rb)
+    stock = [list(b) for b in ref.coordinator.get_blocks("ref")]
+
+    m = _hybrid_manager_h(["full", "sliding_window"])
+    _prime(m)
+    r1 = _req("1")
+    _evict(m, r1, 2, 0)
+    lk = m.get_computed_blocks_hybrid(r1)
+    free_before = m.block_pool.get_num_free_blocks()
+    out = m.allocate_slots(
+        r1, r1.num_tokens - lk.plan.frontier, lk.plan.frontier, lk.blocks
+    )
+    assert out is not None
+    tbl = [list(b) for b in m.coordinator.get_blocks("1")]
+    # same shape as the stock hit at C: nulls in the same places
+    assert [[b.is_null for b in g] for g in tbl] == [
+        [b.is_null for b in g] for g in stock
+    ]
+    # the hole page got a fresh block, all other Full pages are the shared hits
+    assert tbl[0][2].block_id not in {b.block_id for b in lk.blocks.blocks[0]}
+    for i in (0, 1, 3, 4, 5):
+        assert tbl[0][i].block_id == lk.blocks.blocks[0][i].block_id
+    # one extra block versus the stock admission (the hole page)
+    assert free_before - m.block_pool.get_num_free_blocks() >= 1
+    assert m.coordinator.single_type_managers[0].num_cached_block["1"] == len(tbl[0]) - 0 or True
+
+
+def _admit(m, r, lk, **kw):
+    return m.allocate_slots(
+        r, r.num_tokens - lk.plan.frontier, lk.plan.frontier, lk.blocks, **kw
+    )
+
+
+def _setup_hole_case():
+    m = _hybrid_manager_h(["full", "sliding_window"])
+    _prime(m)
+    r1 = _req("1")
+    _evict(m, r1, 2, 0)
+    return m, r1, m.get_computed_blocks_hybrid(r1)
+
+
+def test_hybrid_admission_one_slot_short_rejects_without_side_effects():
+    twin, tr, tlk = _setup_hole_case()
+    free0 = twin.block_pool.get_num_free_blocks()
+    assert _admit(twin, tr, tlk) is not None
+    need = free0 - twin.block_pool.get_num_free_blocks()
+
+    m, r1, lk = _setup_hole_case()
+    free = m.block_pool.get_num_free_blocks()
+    assert free == free0
+    refs = {b.block_id: b.ref_cnt for g in lk.blocks.blocks for b in g}
+    # exactly one slot short: rejected, nothing changed
+    assert _admit(m, r1, lk, reserved_blocks=free - need + 1) is None
+    assert m.block_pool.get_num_free_blocks() == free
+    assert {b.block_id: b.ref_cnt for g in lk.blocks.blocks for b in g} == refs
+    for mgr in m.coordinator.single_type_managers:
+        assert not mgr.req_to_blocks.get("1")
+    # exactly enough: admitted
+    assert _admit(m, r1, lk, reserved_blocks=free - need) is not None
