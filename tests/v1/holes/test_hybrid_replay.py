@@ -902,3 +902,68 @@ def test_worker_skips_stock_mamba_preprocess_for_replay_requests():
     )()
     assert preprocess_skip_requests(out) == {"b"}  # the tail takes the stock path
     assert preprocess_skip_requests(type("SO", (), {"hybrid_replay_steps": {}})()) == set()
+
+
+def _mamba_prime(r):
+    s = r.scheduler
+    s.max_num_scheduled_tokens = 32
+    _prime_runner(r)
+    s.max_num_scheduled_tokens = 1000
+
+
+def test_scheduler_mamba_abort_mid_replay_returns_private_state_and_sources():
+    from vllm.v1.request import RequestStatus
+
+    r = _hyb_runner(kinds=("full", "mamba"))
+    _mamba_prime(r)
+    s = r.scheduler
+    m = s.kv_cache_manager
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    s.add_request(b)
+    o1 = s.schedule()
+    assert o1.hybrid_replay_steps["b"].state_sources  # a restore is in flight
+    s.finish_requests("b", RequestStatus.FINISHED_ABORTED)
+    assert "b" not in m._hybrid
+    _out(s, o1)
+    assert all(blk.ref_cnt == 0 for blk in m.block_pool.blocks if not blk.is_null)
+
+
+def test_scheduler_mamba_chunked_span_keeps_one_private_state_block():
+    r = _hyb_runner(kinds=("full", "mamba"))
+    _mamba_prime(r)
+    s = r.scheduler
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    _evict_gpu(r, b, 3, 0)  # a 32-token repair span [32, 64)
+    s.add_request(b)
+    s.max_num_scheduled_tokens = 16  # chunk the span at one page
+    o1 = s.schedule()
+    st1 = o1.hybrid_replay_steps["b"]
+    assert (st1.start, st1.end, st1.restore) == (32, 48, True)
+    priv = st1.state_dests[1][0]
+    _out(s, o1)
+    o2 = s.schedule()
+    st2 = o2.hybrid_replay_steps["b"]
+    assert (st2.start, st2.end, st2.restore) == (48, 64, False)
+    # the same physical block continues the running state one page later;
+    # no second copy from the cache
+    assert st2.state_sources == {} and st2.state_dests == {}
+    row = st2.replacement_rows[1]
+    assert row == [0, 0, 0, priv]
+
+
+def test_scheduler_full_swa_mamba_all_three_groups_replay():
+    r = _hyb_runner(kinds=("full", "swa", "mamba"))
+    s = r.scheduler
+    assert s.hybrid_holes_enabled is True
+    _mamba_prime(r)
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    s.add_request(b)
+    out = s.schedule()
+    st = out.hybrid_replay_steps["b"]
+    assert (st.start, st.end, st.restore) == (32, 48, True)
+    assert set(st.replacement_rows) == {1, 2}
+    assert set(st.state_sources) == {2}  # only Mamba has a state copy
+    assert len(st.replacement_rows[1]) == 3 and st.replacement_rows[2][-1] != 0
