@@ -1857,6 +1857,13 @@ class Scheduler(SchedulerInterface):
         elif self.connector is None:
             if not self.hole_config.test_hooks:
                 reason = "hybrid holes need the CPU offload connector with the rate policy."
+        elif not self._connector_async_mask:
+            # M 7, Q5 (a): effective hybrid holes need the CPU offload
+            # connector with the rate policy; other mask connectors stay off.
+            reason = (
+                f"hybrid holes need the OffloadingConnector, not "
+                f"{type(self.connector).__name__}."
+            )
         else:
             ktc = vllm_config.kv_transfer_config
             allowed, why = connector_allows_holes(

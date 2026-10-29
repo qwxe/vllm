@@ -159,6 +159,9 @@ def _hybrid_gate(connector, extra):
     """Run Scheduler._hybrid_holes_effective on a stub scheduler (M 7, Q5 (a))."""
     from types import SimpleNamespace as NS
 
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
     from vllm.v1.core.sched.scheduler import Scheduler
 
     stub = NS(
@@ -168,6 +171,7 @@ def _hybrid_gate(connector, extra):
         use_eagle=False,
         use_v2_model_runner=False,
         connector=connector,
+        _connector_async_mask=isinstance(connector, OffloadingConnector),
         hole_config=NS(test_hooks=False),
     )
     cfg = NS(kv_transfer_config=NS(kv_connector_extra_config=extra))
