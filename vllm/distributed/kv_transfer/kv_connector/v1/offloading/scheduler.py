@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
+from vllm.v1.core.holes import get_hole_config
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
@@ -573,6 +574,17 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
+        self.manager.set_group_kinds(
+            [
+                "mamba"
+                if isinstance(g.kv_cache_spec, MambaSpec)
+                else "full"
+                if g.sliding_window_size_in_chunks is None
+                else "swa"
+                for g in self.config.kv_group_configs
+            ],
+            get_hole_config(vllm_config).min_reuse_blocks,
+        )
         self._connector_stats = OffloadingConnectorStats()
 
         full_attention_groups: list[int] = []

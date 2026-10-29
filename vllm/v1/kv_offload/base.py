@@ -408,6 +408,13 @@ class OffloadingManager(ABC):
         """
         return False
 
+    def set_group_kinds(self, kinds: Sequence[str], min_reuse_blocks: int) -> None:
+        """holes: called once by the scheduler-side connector right after the
+        manager is built. ``kinds[i]`` is "full", "swa" or "mamba" for KV
+        cache group ``i``; ``min_reuse_blocks`` is the hole config's value
+        (1 when holes are not configured). Default: ignored."""
+        return
+
     def reset_cache(self) -> None:
         """Evict all tracked blocks and reset internal state."""
         return
