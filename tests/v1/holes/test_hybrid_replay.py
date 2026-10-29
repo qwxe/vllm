@@ -85,3 +85,52 @@ def test_furthest_frontier_with_benefit_wins():
 def test_no_benefit_repair_as_costly_as_stock():
     # hole [60,64) forces replay [0,64) to reach frontier 64: 64+36 == 100
     assert plan_hybrid_replay(N, [[(60, 64)]], [{64}], [0, 64]) is None
+
+
+# ---- supported group combinations (M section 7) ---------------------------
+
+
+def _mgr(cls, **attrs):
+    m = object.__new__(cls)
+    for k, v in attrs.items():
+        setattr(m, k, v)
+    return m
+
+
+def _kinds(*specs):
+    from vllm.v1.core.holes import hybrid_group_kinds
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+        RSWAManager,
+        SlidingWindowManager,
+    )
+
+    table = {
+        "full": lambda: _mgr(FullAttentionManager),
+        "swa": lambda: _mgr(SlidingWindowManager),
+        "mamba": lambda: _mgr(MambaManager, mamba_cache_mode="align"),
+        "mamba_all": lambda: _mgr(MambaManager, mamba_cache_mode="all"),
+        "rswa": lambda: _mgr(RSWAManager),
+    }
+    return hybrid_group_kinds([table[s]() for s in specs])
+
+
+def test_supported_combinations_full_not_gid0():
+    assert _kinds("mamba", "mamba", "full") == (
+        ["mamba", "mamba", "full"],
+        None,
+    )
+    assert _kinds("full", "full")[0] == ["full", "full"]
+    assert _kinds("full", "swa")[0] == ["full", "swa"]
+    assert _kinds("swa", "mamba", "full")[0] == ["swa", "mamba", "full"]
+
+
+def test_unsupported_combinations_have_reason():
+    for combo in (("mamba",), ("swa",), ("mamba", "swa")):
+        kinds, reason = _kinds(*combo)
+        assert kinds is None and "Full" in reason
+    kinds, reason = _kinds("full", "mamba_all")
+    assert kinds is None and "align" in reason
+    kinds, reason = _kinds("full", "rswa")
+    assert kinds is None and "RSWAManager" in reason
