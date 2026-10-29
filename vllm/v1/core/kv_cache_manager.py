@@ -262,6 +262,7 @@ class KVCacheManager:
         # unchanged. Whether they take effect also needs the L2 rate gate in
         # the scheduler.
         self._hybrid: dict[str, _HybridRes] = {}
+        self._hybrid_stage: dict[str, tuple] = {}
         self.hybrid_holes_enabled = (
             self.hole_config.enabled
             and enable_caching
@@ -434,28 +435,23 @@ class KVCacheManager:
             private[gid] = need
         return sources, private
 
-    def hybrid_extra_blocks(self, request: Request, lookup: HybridLookup) -> int:
-        """Free blocks the replay needs beyond a stock admission: protected
-        sources that are currently evictable and the private SWA pages."""
-        sources, private = self._hybrid_collect(request, lookup)
-        hit_ids = {
-            b.block_id for g in lookup.blocks.blocks for b in g if not b.is_null
-        }
-        uniq = {
-            b.block_id: b
-            for src in sources.values()
-            for b in src.values()
-            if b.block_id not in hit_ids
-        }
-        return sum(1 for b in uniq.values() if b.ref_cnt == 0) + sum(private.values())
-
-    def acquire_hybrid(self, request: Request, lookup: HybridLookup) -> None:
-        """Protect the replay sources and allocate the private pages; call
-        right after a successful admission (capacity was reserved)."""
+    def protect_hybrid_sources(self, request: Request, lookup: HybridLookup) -> int:
+        """All-hit-first: take a reference on every retained source the replay
+        will read, before any allocation of the admission can recycle one.
+        Returns the number of private pages still to allocate (the caller
+        reserves them in the admission check). Undo with
+        ``release_hybrid`` if the admission fails."""
         sources, private = self._hybrid_collect(request, lookup)
         uniq = {b.block_id: b for src in sources.values() for b in src.values()}
         protected = list(uniq.values())
         self.block_pool.touch(protected)
+        self._hybrid_stage[request.request_id] = (sources, private, protected)
+        return sum(private.values())
+
+    def acquire_hybrid(self, request: Request, lookup: HybridLookup) -> None:
+        """Allocate the private pages and register the plan's resources; call
+        right after a successful admission (capacity was reserved)."""
+        sources, private, protected = self._hybrid_stage.pop(request.request_id)
         priv = {
             gid: (self.block_pool.get_new_blocks(n) if n else [])
             for gid, n in private.items()
@@ -471,6 +467,12 @@ class KVCacheManager:
         self._hybrid[request.request_id] = _HybridRes(
             protected, priv, sources, holes, lookup.plan
         )
+
+    def drop_hybrid_stage(self, request_id: str) -> None:
+        """The admission failed: give the protection back."""
+        stage = self._hybrid_stage.pop(request_id, None)
+        if stage is not None:
+            self.block_pool.free_blocks(reversed(stage[2]))
 
     def release_hybrid(self, request_id: str) -> list[KVCacheBlock]:
         """Detach the replay resources and return their blocks (the caller

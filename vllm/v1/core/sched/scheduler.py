@@ -1456,9 +1456,10 @@ class Scheduler(SchedulerInterface):
 
                 reserved_blocks = 0
                 if hybrid_lookup is not None:
-                    # Sources to protect and private SWA pages are part of
-                    # the admission transaction.
-                    reserved_blocks = self.kv_cache_manager.hybrid_extra_blocks(
+                    # All-hit-first: protect the replay sources now, before
+                    # the admission allocates anything; the private SWA pages
+                    # are reserved in the admission check.
+                    reserved_blocks = self.kv_cache_manager.protect_hybrid_sources(
                         request, hybrid_lookup
                     )
                 if load_kv_async:
@@ -1503,6 +1504,7 @@ class Scheduler(SchedulerInterface):
                     if hybrid_lookup is not None:
                         request.hybrid_plan = None
                         request.pending_hole_ranges = []
+                        self.kv_cache_manager.drop_hybrid_stage(request.request_id)
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
