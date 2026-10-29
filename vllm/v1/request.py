@@ -187,6 +187,9 @@ class Request:
         # num_computed_tokens is the tail frontier; the tokens in these
         # ranges are not computed even though they lie below it.
         self.pending_hole_ranges: list[tuple[int, int]] = []
+        # holes/L2: ranges a parked request waits for the connector to load
+        # (WAITING_FOR_REMOTE_KVS); the blocks are cached only once loaded.
+        self.pending_load_ranges: list[tuple[int, int]] = []
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

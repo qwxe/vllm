@@ -6,6 +6,8 @@ CPU only: a real Scheduler and OffloadingConnector over the mock spec and mock
 manager of ``tests/v1/kv_connector/unit/offloading_connector/utils.py``.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from tests.v1.kv_connector.unit.offloading_connector.utils import RequestRunner
@@ -163,13 +165,13 @@ def test_t11_multiconnector_keeps_holes_off():
 
 
 @pytest.mark.parametrize("policy", [None, "lru", "arc", "rate"])
-def test_t11_scheduler_with_the_offload_connector_stays_off_until_the_mask_api(policy):
-    """Real scheduler + real OffloadingConnector over the mock spec: the
-    connector has no mask API yet in this stage, so holes stay off for every
-    policy (commit 4 turns them on for rate only)."""
+def test_t11_scheduler_with_the_offload_connector(policy):
+    """Real scheduler + real OffloadingConnector over the mock spec. In the
+    commit-3 stage the connector had no mask API, so holes stayed off for every
+    policy; with the mask API (commit 4) only ``rate`` activates holes."""
     extra = {"eviction_policy": policy} if policy else None
     r = _runner({"enabled": True}, extra_config_overrides=extra)
-    assert r.scheduler.holes_enabled is False
+    assert r.scheduler.holes_enabled is (policy == "rate")
 
 
 # ------------------------------------------------------------------ L commit 4: mask API, async park/resume, store cap (T12, T15)
@@ -294,8 +296,11 @@ def test_t12_mask_and_async_park_keep_hole_and_load_ranges():
     blocks = r.scheduler.kv_cache_manager.get_blocks("b").blocks[0]
     assert [x.block_hash is not None for x in blocks[:4]] == [False, False, False, True]
     # one load job: keys 0 and 2 into the allocated blocks 0 and 2
-    ((src, dst),) = r.offloading_spec.handler.transfer_specs.values()
-    assert isinstance(src, MockLoadStoreSpec)
+    ((src, dst),) = [
+        sd
+        for sd in r.offloading_spec.handler.transfer_specs.values()
+        if isinstance(sd[0], MockLoadStoreSpec)
+    ]
     assert src.offload_keys == [_key(a, 0), _key(a, 2)]
     assert list(dst.block_ids) == [blocks[0].block_id, blocks[2].block_id]
 
@@ -322,7 +327,12 @@ def test_t12_resume_plans_the_hole_without_a_second_lookup():
     _estep(r, complete=False)
     _estep(r, complete=True)  # the load finishes; b is promoted next step
     n_lookup = r.manager.lookup.call_count
-    out = _estep(r)
+    with patch.object(
+        s.kv_cache_manager,
+        "record_prefix_cache_stats",
+        wraps=s.kv_cache_manager.record_prefix_cache_stats,
+    ) as recorded:
+        out = _estep(r)
     assert out.scheduled_hole_ranges == {"b": [(BS, 2 * BS)]}
     assert out.num_scheduled_tokens["b"] == BS + 5  # hole piece + tail
     assert r.manager.lookup.call_count == n_lookup  # no new lookup on resume
@@ -330,8 +340,8 @@ def test_t12_resume_plans_the_hole_without_a_second_lookup():
     assert b.num_output_tokens == 1
     blocks = s.kv_cache_manager.get_blocks("b").blocks[0]
     assert all(x.block_hash is not None for x in blocks[:4])
-    # one prefix-cache record for the admission, not two
-    assert s.kv_cache_manager.prefix_cache_stats.requests == 1
+    # the resume records no prefix-cache stats (the admission did)
+    assert recorded.call_count == 0
 
 
 def _store_cap_check(r, req_id="b"):
@@ -350,7 +360,7 @@ def _store_cap_check(r, req_id="b"):
 
 
 def test_t15_store_offer_never_runs_past_an_uncomputed_hole():
-    r = _l2_runner({"step_budget": BS, "min_piece": BS})
+    r = _l2_runner({"step_budget": BS, "min_piece": BS, "chunk_granule": BS})
     a = _fill_gpu_cache(r, PROMPT)
     probe = U.make_request("probe", PROMPT)
     r.scheduler.holes_evict_token_range(probe, BS, 3 * BS)  # GPU keeps 0 and 3
@@ -369,7 +379,7 @@ def test_t15_store_offer_never_runs_past_an_uncomputed_hole():
 
 
 def test_t15_abort_mid_hole_offers_nothing_past_the_first_pending_hole():
-    r = _l2_runner({"step_budget": BS, "min_piece": BS})
+    r = _l2_runner({"step_budget": BS, "min_piece": BS, "chunk_granule": BS})
     a = _fill_gpu_cache(r, PROMPT)
     probe = U.make_request("probe", PROMPT)
     r.scheduler.holes_evict_token_range(probe, BS, 3 * BS)

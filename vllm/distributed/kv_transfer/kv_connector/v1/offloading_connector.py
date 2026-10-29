@@ -14,6 +14,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.hole_mask import (
+    SupportsBlockHitMask,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
     KVConnectorStats,
@@ -40,6 +43,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.core.holes import get_hole_config
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -50,7 +54,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 
-class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsBlockHitMask):
     @cached_property
     def _bounding_group_ids(self) -> tuple[int, ...]:
         """Prefix-cacheable groups this connector does not offload.
@@ -85,6 +89,15 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
 
         offloading_config = build_offloading_config(vllm_config, kv_cache_config)
+        if (
+            get_hole_config(vllm_config).enabled
+            and offloading_config.cache.blocks_per_chunk != 1
+        ):
+            # holes/L2: a chunk is one block, so a hole never splits a chunk.
+            raise ValueError(
+                "holes with the OffloadingConnector need blocks_per_chunk == 1 "
+                f"(got {offloading_config.cache.blocks_per_chunk})"
+            )
         self._canonical_layout = offloading_config.canonical_layout
         spec = OffloadingSpecFactory.create_spec(offloading_config)
 
@@ -183,6 +196,23 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         )
         bound = min(per_group_hits[group_id] for group_id in self._bounding_group_ids)
         return max(0, bound - num_computed_tokens)
+
+    def get_block_hit_mask(
+        self, request: "Request", local_hit: list[bool]
+    ) -> tuple[list[bool] | None, bool]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_block_hit_mask(request, local_hit)
+
+    def update_state_after_alloc_with_ranges(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        load_ranges: list[tuple[int, int]],
+    ) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_state_after_alloc_with_ranges(
+            request, blocks, load_ranges
+        )
 
     def get_external_cache_hit_sources(
         self,

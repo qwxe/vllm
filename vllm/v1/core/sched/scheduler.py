@@ -406,6 +406,14 @@ class Scheduler(SchedulerInterface):
             if not allowed:
                 logger.warning("Holes disabled: %s", reason)
                 self.holes_enabled = False
+        # holes/L2: only the CPU offload connector's asynchronous block loads
+        # park a request (WAITING_FOR_REMOTE_KVS); any other mask connector
+        # keeps them treated as misses.
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+            OffloadingConnector,
+        )
+
+        self._connector_async_mask = isinstance(self.connector, OffloadingConnector)
         self._warned_async_mask = False
         self._step_hole_ranges: dict[str, list[tuple[int, int]]] = {}
         self._extra_segments = 0
@@ -1033,12 +1041,21 @@ class Scheduler(SchedulerInterface):
                 load_ranges: list[tuple[int, int]] = []
                 hole_mode = (
                     self.holes_enabled
-                    and request.num_computed_tokens == 0
+                    and (request.num_computed_tokens == 0 or request.pending_hole_ranges)
                     and not request.has_encoder_inputs
                 )
+                # A request parked for an async range load resumes with its
+                # frontier in num_computed_tokens and its holes pending.
+                hole_resume = hole_mode and request.num_computed_tokens > 0
+                hole_load_async = False
 
                 # Get already-cached tokens.
-                if hole_mode:
+                if hole_resume:
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = request.num_computed_tokens
+                    new_holes = request.pending_hole_ranges
+                elif hole_mode:
                     ext_mask = None
                     if self.connector is not None:
                         assert isinstance(self.connector, SupportsBlockHitMask)
@@ -1051,7 +1068,9 @@ class Scheduler(SchedulerInterface):
                         if ext_mask is None:
                             skip_request(request_queue)
                             continue
-                        if mask_async:
+                        if mask_async and self._connector_async_mask:
+                            hole_load_async = True
+                        elif mask_async:
                             if not self._warned_async_mask:
                                 logger.warning(
                                     "Asynchronous block-mask loads are not "
@@ -1068,6 +1087,7 @@ class Scheduler(SchedulerInterface):
                         request, ext_mask
                     )
                     num_computed_tokens = num_new_local_computed_tokens
+                    load_kv_async = hole_load_async and bool(load_ranges)
                     if request.prefill_stats and request.num_preemptions <= 0:
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
@@ -1230,7 +1250,7 @@ class Scheduler(SchedulerInterface):
                 hole_pieces = []
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
-                    assert num_external_computed_tokens > 0
+                    assert num_external_computed_tokens > 0 or load_ranges
                     num_new_tokens = 0
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
@@ -1437,7 +1457,13 @@ class Scheduler(SchedulerInterface):
                     # holes/core: the connector loads block ranges into the
                     # blocks allocated in place; they are cached now (sync
                     # load before the forward, as for stock external tokens).
-                    self.kv_cache_manager.cache_hole_blocks(request, load_ranges)
+                    request.pending_hole_ranges = new_holes
+                    if load_kv_async:
+                        # Cached only once the load is done
+                        # (_update_waiting_for_remote_kv).
+                        request.pending_load_ranges = load_ranges
+                    else:
+                        self.kv_cache_manager.cache_hole_blocks(request, load_ranges)
                     self.connector.update_state_after_alloc_with_ranges(  # type: ignore[union-attr]
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
@@ -1470,7 +1496,9 @@ class Scheduler(SchedulerInterface):
                         )
 
                 # Record at admission so unscheduled lookups are not counted.
-                if hole_mode:
+                if hole_resume:
+                    pass
+                elif hole_mode:
                     self.kv_cache_manager.record_prefix_cache_stats(
                         request,
                         num_new_local_computed_tokens
@@ -1810,6 +1838,7 @@ class Scheduler(SchedulerInterface):
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         request.pending_hole_ranges = []
+        request.pending_load_ranges = []
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -3420,6 +3449,8 @@ class Scheduler(SchedulerInterface):
                         request.request_id, request.num_computed_tokens
                     )
             else:
+                request.pending_hole_ranges = []
+                request.pending_load_ranges = []
                 # No valid computed tokens, release allocated blocks.
                 # There may be a local cache hit on retry.
                 # (Freed blocks are re-recorded for zeroing when
@@ -3427,6 +3458,11 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager.free(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
+        elif request.pending_load_ranges:
+            # holes/L2: cache only the loaded ranges; hole blocks are not
+            # computed yet and are never published here.
+            self.kv_cache_manager.cache_hole_blocks(request, request.pending_load_ranges)
+            request.pending_load_ranges = []
         else:
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
@@ -3560,6 +3596,34 @@ class Scheduler(SchedulerInterface):
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
+
+            if request.pending_load_ranges:
+                # holes/L2: a failed block of an async range load becomes a
+                # hole; the frontier (num_computed_tokens) is unchanged.
+                bs = self.block_size
+                failed: list[tuple[int, int]] = []
+                for start, end in request.pending_load_ranges:
+                    for bidx in range(start // bs, end // bs):
+                        if req_block_ids[bidx] in invalid_block_ids:
+                            if failed and failed[-1][1] == bidx * bs:
+                                failed[-1] = (failed[-1][0], (bidx + 1) * bs)
+                            else:
+                                failed.append((bidx * bs, (bidx + 1) * bs))
+                if failed:
+                    request.pending_load_ranges = subtract_ranges(
+                        request.pending_load_ranges, failed
+                    )
+                    holes = sorted(request.pending_hole_ranges + failed)
+                    merged: list[tuple[int, int]] = []
+                    for h in holes:
+                        if merged and merged[-1][1] >= h[0]:
+                            merged[-1] = (merged[-1][0], max(merged[-1][1], h[1]))
+                        else:
+                            merged.append(h)
+                    request.pending_hole_ranges = merged
+                    total_affected_tokens += range_tokens(failed)
+                    affected_req_ids.add(request.request_id)
+                continue
 
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
