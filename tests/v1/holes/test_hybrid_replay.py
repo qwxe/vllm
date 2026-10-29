@@ -488,6 +488,15 @@ def _hyb_runner(
             return FullAttentionSpec(
                 block_size=BS, num_kv_heads=1, head_size=1, dtype=torch.float32
             )
+        if kind == "mamba":
+            from vllm.v1.kv_cache_interface import MambaSpec
+
+            return MambaSpec(
+                block_size=BS,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            )
         return SlidingWindowSpec(
             block_size=BS,
             num_kv_heads=1,
@@ -830,3 +839,59 @@ def test_t10_hybrid_replay_step_does_not_signal_prefill_done():
     s.update_from_output(out, mro)
     s.connector.on_prefill_done.assert_not_called()
     s.eviction_policy.on_prefill_done.assert_not_called()
+
+
+# ---- Mamba execution (stage 3 remainder): private running state + restore ----
+
+
+def test_scheduler_mamba_group_is_effective_and_replay_carries_a_state_restore():
+    r = _hyb_runner(kinds=("full", "mamba"))
+    s = r.scheduler
+    assert s.hybrid_holes_enabled is True
+    _prime_runner(r)
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)  # Full page 2 missing; Mamba state at 32 retained
+    s.add_request(b)
+    out = s.schedule()
+    st = out.hybrid_replay_steps["b"]
+    assert (st.start, st.end, st.restore) == (32, 48, True)
+    # Mamba execution row: private running-state block at the span's last page,
+    # null elsewhere; the source is the cached boundary state at 32.
+    row = st.replacement_rows[1]
+    assert len(row) == 3 and row[0] == 0 and row[1] == 0 and row[2] != 0
+    m = s.kv_cache_manager
+    src = m.block_pool.get_cached_block(b.block_hashes[1], [1])[0]
+    assert st.state_sources == {1: [src.block_id]}
+    assert st.state_dests == {1: [row[2]]}
+    assert row[2] != src.block_id
+    # the source is protected while the replay runs and everything is returned
+    assert src.ref_cnt >= 2
+    mro = U.fake_output(out)
+    mro.sampled_token_ids = [[]]
+    s.update_from_output(out, mro)
+    out2 = s.schedule()  # tail: the real rows come back, stock Mamba restore
+    st2 = out2.hybrid_replay_steps["b"]
+    assert st2.replacement_rows[1] == m.get_block_ids("b")[1]
+    assert st2.state_sources == {} and st2.state_dests == {}
+
+
+def test_scheduler_mamba_replay_from_zero_has_no_state_restore():
+    r = _hyb_runner(kinds=("full", "mamba"))
+    s = r.scheduler
+    _prime_runner(r)
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 0, 0)  # Full page 0 missing: replay starts at 0
+    s.add_request(b)
+    out = s.schedule()
+    st = out.hybrid_replay_steps["b"]
+    assert (st.start, st.restore) == (0, False)
+    assert st.state_sources == {} and st.state_dests == {}
+    assert st.replacement_rows[1][-1] != 0
+
+
+def test_worker_skips_stock_mamba_preprocess_for_replay_requests():
+    from vllm.v1.worker.mamba_utils import preprocess_skip_requests
+
+    out = type("SO", (), {"hybrid_replay_steps": {"b": object()}})()
+    assert preprocess_skip_requests(out) == {"b"}
+    assert preprocess_skip_requests(type("SO", (), {"hybrid_replay_steps": {}})()) == set()
