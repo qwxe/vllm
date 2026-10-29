@@ -220,3 +220,115 @@ def test_request_has_no_plan_by_default():
         pooling_params=None,
     )
     assert r.hybrid_plan is None and r.hybrid_step_pending is False
+
+
+# ---- hybrid residency scan on a real coordinator (M section 4 steps 2-3) ---
+
+
+def _hybrid_manager(spec_types, block_size=16, num_blocks=64):
+    from tests.v1.core.test_prefix_caching import (
+        _make_hybrid_kv_cache_config,
+        make_kv_cache_manager,
+    )
+
+    cfg = _make_hybrid_kv_cache_config(block_size, num_blocks, spec_types)
+    return make_kv_cache_manager(
+        cfg, max_model_len=8192, enable_caching=True, hash_block_size=block_size
+    )
+
+
+def _req(rid, n_blocks=6, tail=7, block_size=16):
+    from tests.v1.core.test_prefix_caching import make_request
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import init_none_hash
+
+    init_none_hash(sha256)
+    toks = [i for i in range(n_blocks) for _ in range(block_size)] + [99] * tail
+    return make_request(rid, toks, block_size, sha256)
+
+
+def _prime(manager, block_size=16):
+    r0 = _req("0")
+    blocks, n, _ = manager.get_computed_blocks(r0)
+    assert manager.allocate_slots(r0, r0.num_tokens, n, blocks) is not None
+    manager.new_step_starts()
+    manager.free(r0)
+
+
+def test_residency_full_hole_with_swa_states_everywhere():
+    from vllm.v1.core.holes import plan_hybrid_replay
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+    m = _hybrid_manager(["full", "sliding_window"])
+    _prime(m)
+    r1 = _req("1")
+    # evict the Full page [32,48) (group 0)
+    m.block_pool.cached_block_hash_to_block._cache.pop(
+        make_block_hash_with_group_id(r1.block_hashes[2], 0)
+    )
+    res = m.coordinator.hybrid_residency(r1.block_hashes, r1.num_tokens)
+    assert res.full_missing == [[(32, 48)]]
+    # sliding window (2 blocks): exact state exists at 16..96 (short prefix
+    # at 16); candidate frontiers are multiples of 16 below num_tokens-1=102
+    assert res.frontiers == [0, 16, 32, 48, 64, 80, 96]
+    assert res.state_groups == [{16, 32, 48, 64, 80, 96}]
+    plan = plan_hybrid_replay(
+        r1.num_tokens, res.full_missing, res.state_groups, res.frontiers
+    )
+    assert plan.frontier == 96 and plan.spans == ((32, 48),)
+    assert plan.span_restore == (True,) and plan.tail_restore is True
+
+
+def test_residency_swa_window_broken_invalidates_frontier():
+    from vllm.v1.core.holes import plan_hybrid_replay
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+    m = _hybrid_manager(["full", "sliding_window"])
+    _prime(m)
+    r1 = _req("1")
+    # SWA group (gid 1) loses block 4: windows ending at 80 and 96 (blocks
+    # 3-4 / 4-5) are broken; 64 (blocks 2-3) is intact.
+    m.block_pool.cached_block_hash_to_block._cache.pop(
+        make_block_hash_with_group_id(r1.block_hashes[4], 1)
+    )
+    res = m.coordinator.hybrid_residency(r1.block_hashes, r1.num_tokens)
+    assert res.full_missing == [[]]
+    assert res.state_groups == [{16, 32, 48, 64}]
+    # all Full pages present: stock path, nothing to replan
+    assert (
+        plan_hybrid_replay(
+            r1.num_tokens, res.full_missing, res.state_groups, res.frontiers
+        )
+        is None
+    )
+
+
+def test_residency_full_not_gid0_mamba_first():
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+    m = _hybrid_manager(["mamba_align", "full"])
+    _prime(m)
+    r1 = _req("1")
+    m.block_pool.cached_block_hash_to_block._cache.pop(
+        make_block_hash_with_group_id(r1.block_hashes[1], 1)
+    )
+    res = m.coordinator.hybrid_residency(r1.block_hashes, r1.num_tokens)
+    assert res.full_missing == [[(16, 32)]]  # the Full group is gid 1
+
+
+def test_residency_min_reuse_turns_short_run_into_missing():
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+    m = _hybrid_manager(["full", "sliding_window"])
+    _prime(m)
+    r1 = _req("1")
+    for i in (1, 3):  # pages 1 and 3 missing; page 2 is a run of one page
+        m.block_pool.cached_block_hash_to_block._cache.pop(
+            make_block_hash_with_group_id(r1.block_hashes[i], 0)
+        )
+    res = m.coordinator.hybrid_residency(r1.block_hashes, r1.num_tokens)
+    assert res.full_missing == [[(16, 32), (48, 64)]]
+    res2 = m.coordinator.hybrid_residency(
+        r1.block_hashes, r1.num_tokens, min_reuse_blocks=2
+    )
+    assert res2.full_missing == [[(16, 64)]]
