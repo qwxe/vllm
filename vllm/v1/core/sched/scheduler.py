@@ -3633,7 +3633,14 @@ class Scheduler(SchedulerInterface):
         if load_failed:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
-            if request.num_computed_tokens:
+            if request.pending_load_ranges:
+                # holes/L2 (L 8.2): publish only the ranges that loaded; the
+                # failed ranges already became holes and stay uncached.
+                self.kv_cache_manager.cache_hole_blocks(
+                    request, request.pending_load_ranges
+                )
+                request.pending_load_ranges = []
+            elif request.num_computed_tokens:
                 # Cache any valid computed tokens.
                 self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
                 if self.needs_kv_cache_zeroing:
