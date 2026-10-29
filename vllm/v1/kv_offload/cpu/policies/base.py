@@ -133,6 +133,20 @@ class CachePolicy(ABC):
         Ghost lists and adaptive state are also reset.
         """
 
+    def set_group_kinds(self, kinds: Sequence[str], min_reuse_blocks: int) -> None:
+        """holes: group kinds ("full"/"swa"/"mamba") and the hole config's
+        ``min_reuse_blocks``, handed over once by the manager. Default: ignored."""
+        return
+
+    def on_request_arrival(self, req_context: ReqContext) -> None:
+        """A request was first seen (session-aware policies). Default: ignored."""
+        return
+
+    def on_prefill_done(self, req_context: ReqContext) -> None:
+        """The request's prefill finished (first sampled token). Default:
+        ignored."""
+        return
+
     def mark_evictable(self, key: OffloadKey) -> None:
         """Called when a chunk's ref_cnt transitions to 0."""
         return

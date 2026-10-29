@@ -93,6 +93,9 @@ class ReqContext:
     kv_transfer_params: dict[str, Any] | None = None
     kv_hints: KvHintsEnvelope | None = None
     load_tier_filter: TierFilter = TierFilter.ALL
+    # Session of the request (holes/rate): ``Request.session_id`` or
+    # ``sampling_params.extra_args["session_id"]``; None = a session of its own.
+    session_id: str | None = None
     # Per-request scratch space keyed by value type, so a tier can parse
     # kv_transfer_params and kv_hints once (in on_new_request) and read the
     # result back on later calls for the same request.
@@ -407,6 +410,11 @@ class OffloadingManager(ABC):
         to be called even when no requests are scheduled.
         """
         return False
+
+    def on_prefill_done(self, req_context: ReqContext) -> None:
+        """Called once when the request's prefill finished (its first non-empty
+        sampled tokens). Default: ignored."""
+        return
 
     def set_group_kinds(self, kinds: Sequence[str], min_reuse_blocks: int) -> None:
         """holes: called once by the scheduler-side connector right after the

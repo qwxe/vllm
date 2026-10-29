@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from typing import Any
 from dataclasses import dataclass, field
 
 from typing_extensions import override
@@ -63,6 +64,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        policy_config: Mapping[str, Any] | None = None,
     ):
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
@@ -72,7 +74,12 @@ class CPUOffloadingManager(OffloadingManager):
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
             cache_policy, cache_policy_module_path
         )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
+        if policy_config is None:
+            self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
+        else:
+            self._policy = policy_cls(
+                cache_capacity=num_chunks, policy_config=policy_config
+            )
         # Track the number of chunks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
@@ -183,7 +190,16 @@ class CPUOffloadingManager(OffloadingManager):
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         self._get_request_cache_access(req_context)
+        self._policy.on_request_arrival(req_context)
         return RequestOffloadingContext()
+
+    @override
+    def on_prefill_done(self, req_context: ReqContext) -> None:
+        self._policy.on_prefill_done(req_context)
+
+    @override
+    def set_group_kinds(self, kinds: Sequence[str], min_reuse_blocks: int) -> None:
+        self._policy.set_group_kinds(kinds, min_reuse_blocks)
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:

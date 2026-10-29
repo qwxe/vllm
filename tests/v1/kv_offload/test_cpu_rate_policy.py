@@ -82,6 +82,13 @@ def put_chain(pol, c, ids, g=0, start_pos=T, ready=True, pos=None):
     return keys, chunks
 
 
+def adopt(c, src, keys):
+    """The request ``c`` reuses keys another request positioned (prefix hits
+    carry the same absolute positions in every request)."""
+    for k in keys:
+        c.set_offload_key_position(k, src._offload_key_positions[k])
+
+
 def finish(pol, c, key_groups, clock=None, t=None):
     if t is not None:
         clock.t = t
@@ -193,6 +200,7 @@ def test_t1_chunk_with_two_reader_sessions_sums_and_newer_request_replaces():
     ka, _ = put_chain(pol, ca, [1, 2, 3])
     finish(pol, ca, [ka], clk, 1.0)
     # b1 reads the same prefix chunks 1,2 (loaded)
+    adopt(cb, ca, ka[:2])
     finish(pol, cb, [ka[:2]], clk, 1.0)
     set_rates(pol, {"sa": 2.0, "sb": 3.0})
     # evicting chunk 1 (front, sole F): both sessions lose 136 of work
@@ -200,6 +208,7 @@ def test_t1_chunk_with_two_reader_sessions_sums_and_newer_request_replaces():
     # sa's newer request reads only chunk 3: sa no longer reads 1, 2
     pol.on_request_arrival(ctx("a2", "sa"))
     a2 = ctx("a2", "sa")
+    adopt(a2, ca, [ka[2]])
     finish(pol, a2, [[ka[2]]], clk, 2.0)
     assert pol.node_action_scores_for_test(ka[2])[0] == pytest.approx(3.0 * 136)
 
@@ -235,6 +244,7 @@ def test_t3_fixture_b_tail_cheaper_than_front():
     pol.on_request_arrival(cb)
     keys, _ = put_chain(pol, ca, [1, 2, 3, 4])
     finish(pol, ca, [keys])
+    adopt(cb, ca, keys[:1])
     finish(pol, cb, [keys[:1]])
     set_rates(pol, {"sa": 0.01, "sb": 1.0})
     f, t = pol.node_action_scores_for_test(keys[-1])
@@ -252,6 +262,7 @@ def test_t4_fixture_c_veto_and_none_leaves_index_unchanged():
     pol.on_request_arrival(cb)
     keys, chunks = put_chain(pol, ca, [1, 2, 3, 4])
     finish(pol, ca, [keys])
+    adopt(cb, ca, keys[:1])
     finish(pol, cb, [keys[:1]])
     set_rates(pol, {"sa": 0.01, "sb": 1.0})
     chunks[keys[2]].ref_cnt = 1  # c2 is being loaded: T is vetoed
@@ -283,6 +294,7 @@ def _t7_node():
     km, chm = put_chain(pol, ca, [21], g=1, pos=[48])
     ks, chs = put_chain(pol, ca, [31], g=2, pos=[48])
     finish(pol, ca, [kf, km, ks])
+    adopt(cb, ca, kf[:1])
     finish(pol, cb, [kf[:1]])  # a hot reader that needs only the front chunk
     # the cold reader (needs everything) makes T cheaper per freed chunk:
     # F = 136 + 0.001*136, T = (136 + 0.001*1176) / 5
@@ -328,6 +340,7 @@ def test_t6_tree_branch_state_end_leaf_and_middle_eviction():
     finish(pol, c1, [k1])
     # r2: c1, c2 are L2 hits (loaded), c3x, c4x are new
     kx, _ = put_chain(pol, c2, [3 + 100, 4 + 100], start_pos=48)
+    adopt(c2, c1, k1[:2])
     finish(pol, c2, [k1[:2] + kx])
     lay = pol.node_layout_for_test()
     assert lay == {
@@ -381,9 +394,11 @@ def test_t6_orphan_parent_starts_a_rootless_node():
 
 
 def make_mgr(n):
-    return CPUOffloadingManager(
+    mgr = CPUOffloadingManager(
         num_chunks=n, cache_policy="rate", policy_config=rate_cfg()
     )
+    mgr._policy.clock = Clock()
+    return mgr
 
 
 def test_t5_manager_pinned_and_pending_chunks_are_never_evicted():

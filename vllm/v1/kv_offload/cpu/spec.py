@@ -5,6 +5,7 @@ from typing import Any
 from typing_extensions import override
 
 from vllm.platforms import current_platform
+from vllm.v1.core.eviction import EvictionConfig
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -135,6 +136,30 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cache_policy_module_path: str | None = self.extra_config.get(
             "cache_policy_module_path"
         )
+        self._policy_config: dict[str, Any] | None = None
+        if self.eviction_policy == "rate":
+            self._policy_config = self._build_rate_policy_config(config)
+
+    def _build_rate_policy_config(self, config: OffloadingConfig) -> dict[str, Any]:
+        """holes/rate at L2: the nested ``rate`` dict of the extra config,
+        validated here so errors surface at spec init as ``ValueError``."""
+        rate = dict(self.extra_config.get("rate") or {})
+        for bad in ("policy", "chunk_tokens"):
+            if bad in rate:
+                raise ValueError(f"unknown rate eviction config key: {bad!r}")
+        rate.setdefault("running_owner", "decode")
+        rate.setdefault("rescore_s", 0)
+        try:
+            EvictionConfig.from_dict({**rate, "policy": "rate"})
+        except AssertionError as e:
+            raise ValueError(f"invalid rate eviction config: {e}") from e
+        return {
+            "rate": rate,
+            "group_tokens_per_chunk": {
+                g.group_id: g.tokens_per_block * self.blocks_per_chunk
+                for g in config.groups
+            },
+        }
 
     @override
     def get_manager(self) -> OffloadingManager:
@@ -155,6 +180,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                policy_config=self._policy_config,
             )
         return self._manager
 
