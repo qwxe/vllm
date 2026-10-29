@@ -5,16 +5,23 @@
 Runs the same deterministic multi-turn workload twice, each arm in its own
 child process (one GPU engine at a time):
 
-* ``off``: stock vLLM prefix caching (holes disabled, LRU eviction);
+* ``off``: holes disabled, stock vLLM prefix caching enabled (LRU eviction);
+  it reuses only the cached prefix up to the first evicted block and
+  recomputes everything after it;
 * ``on``: holes enabled with the rate eviction policy (holes take effect only
   with the rate policy), so evicted middle/front chunks of a cached prefix are
   recomputed as holes while the blocks after them are reused.
 
 Both arms use the same small KV pool (``--num-blocks``) so that eviction, and
-in the ``on`` arm holes, actually occur. Requests run one at a time in a fixed
+in the ``on`` arm holes, actually occur. With the defaults (2 sessions x 6
+turns, 240 blocks) the two sessions' contexts outgrow the pool from turn 3
+on, so part of each session's prefix is evicted while the other runs (with 4
+sessions almost the whole prefix was evicted and holes occurred only
+sometimes). Requests run one at a time in a fixed
 round-robin order over sessions, greedy decoding, bf16 by default. The check
 is exact token equality of every request's output, holes off vs on, plus a
-non-vacuity check: the ``on`` arm must have scheduled hole ranges.
+non-vacuity check: the ``on`` arm must have scheduled hole ranges, and at
+least one holed request must have cached > 0 (blocks after the hole reused).
 
 Usage: HOLES_MODEL=<path> python gpu_holes_onoff_e2e.py [--eager] [--num-blocks N]
 """
@@ -51,8 +58,8 @@ def build_args():
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--num-blocks", type=int, default=240)
     ap.add_argument("--max-model-len", type=int, default=3584)
-    ap.add_argument("--sessions", type=int, default=4)
-    ap.add_argument("--turns", type=int, default=4)
+    ap.add_argument("--sessions", type=int, default=2)
+    ap.add_argument("--turns", type=int, default=6)
     ap.add_argument("--first", type=int, default=1500)
     ap.add_argument("--new", type=int, default=200)
     ap.add_argument("--max-tokens", type=int, default=24)
@@ -188,6 +195,11 @@ def main():
     ok = same == len(off)
     if c["hole_tokens"] == 0:
         print("no holes occurred in the on arm: comparison is vacuous")
+        ok = False
+    holed_cached = [r["cached"] for r in on if r["holed"]]
+    print(f"on-arm holed requests cached tokens: {holed_cached}")
+    if not any(x > 0 for x in holed_cached):
+        print("no holed request reused cached blocks after its hole")
         ok = False
     print("RESULT", "PASS" if ok else "FAIL")
     return 0 if ok else 1
