@@ -182,3 +182,37 @@ def test_replace_row_rejects_overlong_row():
     width = t.block_tables[0].max_num_blocks_per_req
     with pytest.raises(ValueError):
         t.replace_row((list(range(width + 1)), None), 0)
+
+
+# ---- SchedulerOutput carrier and the replay predicate (M section 6, N2) ----
+
+
+def test_hybrid_replay_step_carrier_defaults_empty():
+    from vllm.v1.core.sched.output import HybridReplayStep, SchedulerOutput
+    from vllm.v1.worker.gpu_model_runner import is_hybrid_replay_step
+
+    out = SchedulerOutput.make_empty()
+    assert out.hybrid_replay_steps == {}
+    assert is_hybrid_replay_step(out) is False
+    out.hybrid_replay_steps["r"] = HybridReplayStep(
+        req_id="r",
+        plan_id=1,
+        step_id=0,
+        start=0,
+        end=48,
+        restore=False,
+        replacement_rows={1: [3, 4]},
+    )
+    assert is_hybrid_replay_step(out) is True
+    # the default must not be shared between instances
+    assert SchedulerOutput.make_empty().hybrid_replay_steps == {}
+
+
+def test_request_has_no_plan_by_default():
+    from vllm.v1.request import Request
+
+    r = Request(
+        request_id="x", prompt_token_ids=[1, 2, 3], sampling_params=None,
+        pooling_params=None,
+    )
+    assert r.hybrid_plan is None and r.hybrid_step_pending is False
