@@ -764,3 +764,25 @@ def test_async_scheduler_fence_and_no_placeholders_during_replay():
     o3 = s.schedule()
     assert o3.num_scheduled_tokens["b"] == 7
     assert o3.hybrid_replay_steps["b"].end == o3.hybrid_replay_steps["b"].start
+
+
+def test_scheduler_protects_sources_before_the_first_allocation():
+    r = _hyb_runner()
+    _prime_runner(r)
+    s = r.scheduler
+    m = s.kv_cache_manager
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    # the SWA window of the replay start (32) is pages 0 and 1 of group 1
+    src = [m.block_pool.get_cached_block(b.block_hashes[i], [1])[0] for i in (0, 1)]
+    seen = {}
+    orig = m.allocate_slots
+
+    def spy(*a, **kw):
+        seen["refs"] = [blk.ref_cnt for blk in src]
+        return orig(*a, **kw)
+
+    m.allocate_slots = spy
+    s.add_request(b)
+    s.schedule()
+    assert all(c >= 1 for c in seen["refs"]), seen
