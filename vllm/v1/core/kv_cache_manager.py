@@ -3,7 +3,7 @@
 
 import itertools
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
@@ -153,6 +153,8 @@ class _HybridRes:
     sources: dict[int, dict[int, KVCacheBlock]]
     holes: dict[int, list[Range]]
     plan: HybridReplayPlan
+    # Mamba gid -> span start -> cached boundary state block to restore from
+    state_src: dict[int, dict[int, KVCacheBlock]] = field(default_factory=dict)
 
 
 class KVCacheManager:
@@ -410,11 +412,28 @@ class KVCacheManager:
 
     def _hybrid_collect(self, request: Request, lookup: HybridLookup):
         """Retained source blocks (per SWA group and page) that the replay
-        spans read, and the number of private pages each SWA group needs."""
+        spans read, the number of private pages each SWA/Mamba group needs,
+        and, per Mamba group, the cached boundary-state block of every span
+        that restores (the running state is a private block, never the cached
+        one)."""
         coord = self.coordinator
         sources: dict[int, dict[int, KVCacheBlock]] = {}
         private: dict[int, int] = {}
+        state_src: dict[int, dict[int, KVCacheBlock]] = {}
+        plan = lookup.plan
         for gid, kind in enumerate(coord.hybrid_kinds or []):  # type: ignore[attr-defined]
+            if kind == "mamba":
+                st: dict[int, KVCacheBlock] = {}
+                for (a, _b), restore in zip(plan.spans, plan.span_restore):
+                    if restore:
+                        blk = coord.hybrid_blocks_at(  # type: ignore[attr-defined]
+                            request.block_hashes, a
+                        )[gid][-1]
+                        assert not blk.is_null, "Mamba boundary state vanished"
+                        st[a] = blk
+                state_src[gid] = st
+                private[gid] = 1
+                continue
             if kind != "swa":
                 continue
             mgr = coord.single_type_managers[gid]
@@ -424,7 +443,7 @@ class KVCacheManager:
             )
             src: dict[int, KVCacheBlock] = {}
             need = 0
-            for a, b in lookup.plan.spans:
+            for a, b in plan.spans:
                 lo = mgr.get_num_skipped_tokens(a) // bs
                 for p in range(lo, a // bs):
                     hit = mgr.block_pool.get_cached_block(hashes[p], [gid])
@@ -433,7 +452,7 @@ class KVCacheManager:
                 need = max(need, cdiv(b, bs) - a // bs)
             sources[gid] = src
             private[gid] = need
-        return sources, private
+        return sources, private, state_src
 
     def protect_hybrid_sources(self, request: Request, lookup: HybridLookup) -> int:
         """All-hit-first: take a reference on every retained source the replay
@@ -441,17 +460,27 @@ class KVCacheManager:
         Returns the number of private pages still to allocate (the caller
         reserves them in the admission check). Undo with
         ``release_hybrid`` if the admission fails."""
-        sources, private = self._hybrid_collect(request, lookup)
+        sources, private, state_src = self._hybrid_collect(request, lookup)
         uniq = {b.block_id: b for src in sources.values() for b in src.values()}
+        uniq.update(
+            {b.block_id: b for st in state_src.values() for b in st.values()}
+        )
         protected = list(uniq.values())
         self.block_pool.touch(protected)
-        self._hybrid_stage[request.request_id] = (sources, private, protected)
+        self._hybrid_stage[request.request_id] = (
+            sources,
+            private,
+            protected,
+            state_src,
+        )
         return sum(private.values())
 
     def acquire_hybrid(self, request: Request, lookup: HybridLookup) -> None:
         """Allocate the private pages and register the plan's resources; call
         right after a successful admission (capacity was reserved)."""
-        sources, private, protected = self._hybrid_stage.pop(request.request_id)
+        sources, private, protected, state_src = self._hybrid_stage.pop(
+            request.request_id
+        )
         priv = {
             gid: (self.block_pool.get_new_blocks(n) if n else [])
             for gid, n in private.items()
@@ -465,7 +494,7 @@ class KVCacheManager:
             for gid in coord.hole_group_ids  # type: ignore[attr-defined]
         }
         self._hybrid[request.request_id] = _HybridRes(
-            protected, priv, sources, holes, lookup.plan
+            protected, priv, sources, holes, lookup.plan, state_src
         )
 
     def drop_hybrid_stage(self, request_id: str) -> None:
@@ -513,6 +542,19 @@ class KVCacheManager:
                 else:
                     row.append(res.private[gid][p - start_page].block_id)
             rows[gid] = row
+        state_sources: dict[int, list[int]] = {}
+        state_dests: dict[int, list[int]] = {}
+        for gid, st in res.state_src.items():
+            # Mamba (align): the running state lives in one private block that
+            # sits at the span's last page of the execution row; the cached
+            # boundary state is only ever read (copied into it on a restore).
+            bs = coord.single_type_managers[gid].block_size
+            priv = res.private[gid][0].block_id
+            last = (b - 1) // bs
+            rows[gid] = [null_id] * last + [priv]
+            if restore and a in st:
+                state_sources[gid] = [st[a].block_id]
+                state_dests[gid] = [priv]
         no_write = {}
         for gid, hole_ranges in res.holes.items():
             keep = subtract_ranges([(a, b)], hole_ranges)
@@ -526,6 +568,8 @@ class KVCacheManager:
             end=b,
             restore=restore,
             replacement_rows=rows,
+            state_sources=state_sources,
+            state_dests=state_dests,
             no_write=no_write,
         )
 
@@ -544,7 +588,9 @@ class KVCacheManager:
             start=start,
             end=start,
             restore=restore,
-            replacement_rows={gid: list(real[gid]) for gid in res.sources},
+            replacement_rows={
+                gid: list(real[gid]) for gid in (*res.sources, *res.state_src)
+            },
         )
 
     def get_computed_blocks_hybrid(self, request: Request) -> "HybridLookup | None":

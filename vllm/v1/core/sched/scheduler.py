@@ -1839,9 +1839,9 @@ class Scheduler(SchedulerInterface):
 
     def _hybrid_holes_effective(self, vllm_config: VllmConfig) -> bool:
         """holes/M: the shared capability result for hybrid (multi-group)
-        holes. Needs the manager-level support, the V1 runner, no EAGLE, Full
-        and sliding-window groups only (Mamba state restore is not wired
-        yet) and no connector (no connector = no hybrid holes, M note U4;
+        holes. Needs the manager-level support, the V1 runner, no EAGLE (Full,
+        sliding-window and Mamba-align groups; the Mamba restore runs in the
+        worker, ``mamba_utils.restore_hybrid_mamba_states``) and no connector (no connector = no hybrid holes, M note U4;
         ``holes.test_hooks`` lifts that requirement for CPU tests only). The
         L2 rate connector path stays gated off until stage 4 (Q-A (a));
         ``test_hooks`` lifts that too, for the CPU tests."""
@@ -1853,8 +1853,6 @@ class Scheduler(SchedulerInterface):
             reason = "EAGLE/MTP is outside hybrid holes."
         elif self.use_v2_model_runner:
             reason = "the V2 model runner does not support holes yet."
-        elif "mamba" in (kvm.coordinator.hybrid_kinds or []):  # type: ignore[attr-defined]
-            reason = "Mamba state restore is not implemented yet."
         elif self.connector is None:
             if not self.hole_config.test_hooks:
                 reason = "hybrid holes need the CPU offload connector with the rate policy."

@@ -4189,6 +4189,14 @@ class GPUModelRunner(
                     self._get_mamba_state_copy_funcs(),
                     mamba_bufs.preprocess,
                     align_ctx=mamba_bufs.postprocess_align,
+                    skip_req_ids=mamba_utils.preprocess_skip_requests(
+                        scheduler_output
+                    ),
+                )
+                mamba_utils.restore_hybrid_mamba_states(
+                    scheduler_output,
+                    self.kv_cache_config,
+                    self.compilation_config.static_forward_context,
                 )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.

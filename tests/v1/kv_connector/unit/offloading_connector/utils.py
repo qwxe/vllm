@@ -299,13 +299,15 @@ class RequestRunner:
             for layer_name in group.layer_names:
                 # Shape follows FlashAttention layout:
                 # Shape: (num_blocks, 2, block_size, num_kv_heads, head_size)
+                # (holes: a Mamba group has no heads; the test only needs a
+                # tensor of the right block count)
                 kv_caches[layer_name] = torch.empty(
                     num_gpu_blocks,
                     2,
                     spec.block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    dtype=spec.dtype,
+                    getattr(spec, "num_kv_heads", 1),
+                    getattr(spec, "head_size", 1),
+                    dtype=getattr(spec, "dtype", torch.float32),
                 )
 
         with set_current_vllm_config(vllm_config):

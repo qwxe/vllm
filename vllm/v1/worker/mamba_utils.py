@@ -1443,6 +1443,38 @@ def _resolve_fused_precopy(
     )
 
 
+def preprocess_skip_requests(scheduler_output: SchedulerOutput) -> set[str]:
+    """holes/M: requests whose step is a hybrid replay span. Their Mamba state
+    is a private running block set up by ``restore_hybrid_mamba_states``; the
+    stock align copy (which follows the logical frontier) must not touch it.
+    A tail step (empty span) takes the stock path: it restores the cached
+    state at the frontier like a stock prefix hit."""
+    steps = getattr(scheduler_output, "hybrid_replay_steps", None) or {}
+    return {r for r, st in steps.items() if st.end > st.start}
+
+
+def restore_hybrid_mamba_states(
+    scheduler_output: SchedulerOutput,
+    kv_cache_config: KVCacheConfig,
+    forward_context: dict[str, Any],
+) -> int:
+    """holes/M: copy the cached boundary state (``state_sources``) into the
+    private running block (``state_dests``) of every Mamba group of a hybrid
+    replay step that restores, for every layer and state tensor. Returns the
+    number of block copies issued."""
+    steps = getattr(scheduler_output, "hybrid_replay_steps", None) or {}
+    n = 0
+    for step in steps.values():
+        for gid, srcs in step.state_sources.items():
+            dsts = step.state_dests[gid]
+            for layer_name in kv_cache_config.kv_cache_groups[gid].layer_names:
+                for state in forward_context[layer_name].kv_cache:
+                    for src, dst in zip(srcs, dsts):
+                        state[dst].copy_(state[src])
+                        n += 1
+    return n
+
+
 def preprocess_mamba(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
@@ -1454,6 +1486,7 @@ def preprocess_mamba(
     mamba_state_copy_funcs: MambaStateCopyFuncsByType,
     copy_bufs: MambaCopyBuffers,
     align_ctx: MambaSpecDecodeGPUContext | None = None,
+    skip_req_ids: set[str] | frozenset[str] = frozenset(),
 ):
     """Copy the mamba state of previous step to the last
     (1 + num_speculative_blocks) block.
@@ -1488,6 +1521,11 @@ def preprocess_mamba(
         fused.token_bias.np[:num_reqs] = 0
 
     for i, req_id in enumerate(input_batch.req_ids):
+        if req_id in skip_req_ids:  # holes/M replay span: private state block
+            mamba_state_idx.pop(req_id, None)
+            if fused is not None:
+                fused.state_idx.np[i] = 0
+            continue
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
         if prev_state_idx is None:
