@@ -343,3 +343,32 @@ def plan_hybrid_replay(
             best = plan
             break
     return best
+
+
+def hybrid_group_kinds(managers: list[Any]) -> tuple[list[str] | None, str | None]:
+    """Classify resolved KV cache groups by their manager type (never by
+    group id or model name). Supported (M section 7): ordinary Full, ordinary
+    sliding window and Mamba in align mode, with at least one Full group.
+    Returns ``(kinds, None)`` or ``(None, reason)``."""
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+        SlidingWindowManager,
+    )
+
+    kinds: list[str] = []
+    for gid, m in enumerate(managers):
+        t = type(m)
+        if t is FullAttentionManager:
+            kinds.append("full")
+        elif t is SlidingWindowManager:
+            kinds.append("swa")
+        elif t is MambaManager:
+            if getattr(m, "mamba_cache_mode", None) != "align":
+                return None, f"group {gid}: Mamba needs mamba_cache_mode='align'."
+            kinds.append("mamba")
+        else:
+            return None, f"group {gid}: unsupported manager {t.__name__}."
+    if "full" not in kinds:
+        return None, "no Full attention group (hybrid holes need one)."
+    return kinds, None
