@@ -769,6 +769,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and pcp_world_size == 1
             and self.hybrid_kinds is not None
         )
+        from math import lcm as _lcm
+
+        # Replay chunks are cut on the common block boundary of all groups.
+        self.hybrid_cut_unit = _lcm(*(m.block_size for m in self.single_type_managers))
         # Full groups (by manager type, not by id) hold the hole pages.
         self.hole_group_ids: tuple[int, ...] = tuple(
             i for i, k in enumerate(self.hybrid_kinds or []) if k == "full"

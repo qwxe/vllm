@@ -199,6 +199,9 @@ class Request:
         self.hybrid_span_idx: int = 0
         self.hybrid_span_done: int = 0
         self.hybrid_step_pending: bool = False
+        self.hybrid_step_id: int = 0
+        # Merged token ranges whose replay has completed (publication input).
+        self.hybrid_completed: list[tuple[int, int]] = []
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

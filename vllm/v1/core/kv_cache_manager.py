@@ -12,18 +12,25 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.holes import (
     HoleConfig,
     HybridLookup,
+    HybridReplayPlan,
     Range,
     apply_min_reuse,
     hits_to_holes,
     plan_hybrid_replay,
     range_tokens,
+    subtract_ranges,
 )
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    resolve_block_hashes,
+)
+from vllm.v1.core.sched.output import HybridReplayStep
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -137,6 +144,17 @@ class KVCacheBlocks:
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
 
+@dataclass
+class _HybridRes:
+    """Resources of a running hybrid replay plan (holes/M)."""
+
+    protected: list[KVCacheBlock]
+    private: dict[int, list[KVCacheBlock]]
+    sources: dict[int, dict[int, KVCacheBlock]]
+    holes: dict[int, list[Range]]
+    plan: HybridReplayPlan
+
+
 class KVCacheManager:
     def __init__(
         self,
@@ -243,6 +261,7 @@ class KVCacheManager:
         # holes/M: hybrid (multi-group) holes; the single-group path above is
         # unchanged. Whether they take effect also needs the L2 rate gate in
         # the scheduler.
+        self._hybrid: dict[str, _HybridRes] = {}
         self.hybrid_holes_enabled = (
             self.hole_config.enabled
             and enable_caching
@@ -385,6 +404,146 @@ class KVCacheManager:
             for i, h in enumerate(hit)
         ]
         return blocks, bs
+
+    # ---- holes/M: resources of a running hybrid replay plan ---------------
+
+    def _hybrid_collect(self, request: Request, lookup: HybridLookup):
+        """Retained source blocks (per SWA group and page) that the replay
+        spans read, and the number of private pages each SWA group needs."""
+        coord = self.coordinator
+        sources: dict[int, dict[int, KVCacheBlock]] = {}
+        private: dict[int, int] = {}
+        for gid, kind in enumerate(coord.hybrid_kinds or []):  # type: ignore[attr-defined]
+            if kind != "swa":
+                continue
+            mgr = coord.single_type_managers[gid]
+            bs = mgr.block_size
+            hashes = resolve_block_hashes(
+                request.block_hashes, coord.hash_block_size, bs  # type: ignore[attr-defined]
+            )
+            src: dict[int, KVCacheBlock] = {}
+            need = 0
+            for a, b in lookup.plan.spans:
+                lo = mgr.get_num_skipped_tokens(a) // bs
+                for p in range(lo, a // bs):
+                    hit = mgr.block_pool.get_cached_block(hashes[p], [gid])
+                    assert hit, "SWA window source vanished before protection"
+                    src[p] = hit[0]
+                need = max(need, cdiv(b, bs) - a // bs)
+            sources[gid] = src
+            private[gid] = need
+        return sources, private
+
+    def hybrid_extra_blocks(self, request: Request, lookup: HybridLookup) -> int:
+        """Free blocks the replay needs beyond a stock admission: protected
+        sources that are currently evictable and the private SWA pages."""
+        sources, private = self._hybrid_collect(request, lookup)
+        hit_ids = {
+            b.block_id for g in lookup.blocks.blocks for b in g if not b.is_null
+        }
+        uniq = {
+            b.block_id: b
+            for src in sources.values()
+            for b in src.values()
+            if b.block_id not in hit_ids
+        }
+        return sum(1 for b in uniq.values() if b.ref_cnt == 0) + sum(private.values())
+
+    def acquire_hybrid(self, request: Request, lookup: HybridLookup) -> None:
+        """Protect the replay sources and allocate the private pages; call
+        right after a successful admission (capacity was reserved)."""
+        sources, private = self._hybrid_collect(request, lookup)
+        uniq = {b.block_id: b for src in sources.values() for b in src.values()}
+        protected = list(uniq.values())
+        self.block_pool.touch(protected)
+        priv = {
+            gid: (self.block_pool.get_new_blocks(n) if n else [])
+            for gid, n in private.items()
+        }
+        coord = self.coordinator
+        holes = {
+            gid: hits_to_holes(
+                [not b.is_null for b in lookup.blocks.blocks[gid]],
+                coord.single_type_managers[gid].block_size,
+            )
+            for gid in coord.hole_group_ids  # type: ignore[attr-defined]
+        }
+        self._hybrid[request.request_id] = _HybridRes(
+            protected, priv, sources, holes, lookup.plan
+        )
+
+    def release_hybrid(self, request_id: str) -> list[KVCacheBlock]:
+        """Detach the replay resources and return their blocks (the caller
+        frees them, possibly deferred)."""
+        res = self._hybrid.pop(request_id, None)
+        if res is None:
+            return []
+        out = list(res.protected)
+        for blocks in res.private.values():
+            out.extend(blocks)
+        return out
+
+    def hybrid_replay_step(
+        self,
+        request: Request,
+        plan_id: int,
+        step_id: int,
+        a: int,
+        b: int,
+        restore: bool,
+    ) -> HybridReplayStep:
+        res = self._hybrid[request.request_id]
+        coord = self.coordinator
+        rows: dict[int, list[int]] = {}
+        null_id = self.block_pool.null_block.block_id
+        span_start = next(s for s, e in res.plan.spans if s <= a < e)
+        for gid, srcs in res.sources.items():
+            mgr = coord.single_type_managers[gid]
+            bs = mgr.block_size
+            lo = mgr.get_num_skipped_tokens(a) // bs
+            start_page = span_start // bs
+            row = []
+            for p in range(cdiv(b, bs)):
+                if p < lo:
+                    row.append(null_id)
+                elif p < start_page:
+                    row.append(srcs[p].block_id)
+                else:
+                    row.append(res.private[gid][p - start_page].block_id)
+            rows[gid] = row
+        no_write = {}
+        for gid, hole_ranges in res.holes.items():
+            keep = subtract_ranges([(a, b)], hole_ranges)
+            if keep:
+                no_write[gid] = keep
+        return HybridReplayStep(
+            req_id=request.request_id,
+            plan_id=plan_id,
+            step_id=step_id,
+            start=a,
+            end=b,
+            restore=restore,
+            replacement_rows=rows,
+            no_write=no_write,
+        )
+
+    def hybrid_tail_step(
+        self, request: Request, plan_id: int, step_id: int, start: int, restore: bool
+    ) -> HybridReplayStep:
+        """First step after the replay: put the real rows of the replaced
+        groups back (the worker's rows hold execution views)."""
+        res = self._hybrid[request.request_id]
+        real = self.get_block_ids(request.request_id)
+        assert real is not None
+        return HybridReplayStep(
+            req_id=request.request_id,
+            plan_id=plan_id,
+            step_id=step_id,
+            start=start,
+            end=start,
+            restore=restore,
+            replacement_rows={gid: list(real[gid]) for gid in res.sources},
+        )
 
     def get_computed_blocks_hybrid(self, request: Request) -> "HybridLookup | None":
         """holes/M: hybrid lookup. Returns None when the stock prefix path is
@@ -550,6 +709,7 @@ class KVCacheManager:
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
         hole_ranges: list[Range] | None = None,
+        defer_hole_caching: bool = False,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -808,7 +968,7 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
-        if hole_ranges:
+        if hole_ranges and not defer_hole_caching:
             self.coordinator.cache_hole_blocks(request, hole_ranges)
 
         return self.create_kv_cache_blocks(new_blocks)
@@ -860,6 +1020,10 @@ class KVCacheManager:
 
         """
         self.coordinator.free(request.request_id)
+        if self._hybrid:
+            self.block_pool.free_blocks(
+                reversed(self.release_hybrid(request.request_id))
+            )
 
     def remove_skipped_blocks(
         self,
@@ -893,7 +1057,10 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
-        return self.coordinator.pop_blocks_for_free(request.request_id)
+        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
+        if self._hybrid:
+            blocks = blocks + self.release_hybrid(request.request_id)
+        return blocks
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.

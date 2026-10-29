@@ -57,6 +57,7 @@ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
+    HybridReplayStep,
     KVConnectorBlockState,
     NewRequestData,
     ScheduledEncoderInputStats,
@@ -417,6 +418,8 @@ class Scheduler(SchedulerInterface):
         self._warned_async_mask = False
         self._step_hole_ranges: dict[str, list[tuple[int, int]]] = {}
         self._extra_segments = 0
+        self._hybrid_plan_seq = 0
+        self.hybrid_holes_enabled = self._hybrid_holes_effective(vllm_config)
 
         # holes/rate: pluggable eviction of cached GPU blocks (LRU = stock).
         self.eviction_config = get_eviction_config(vllm_config)
@@ -660,6 +663,8 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int] = {}
         # holes/core: req_id -> hole pieces computed in this step.
         scheduled_hole_ranges: dict[str, list[tuple[int, int]]] = {}
+        # holes/M: req_id -> serialized hybrid replay step of this step.
+        hybrid_steps: dict[str, HybridReplayStep] = {}
         # Attention-metadata entries beyond one per request (extra hole
         # pieces); total entries stay <= max_num_seqs.
         self._extra_segments = 0
@@ -752,6 +757,11 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens - request.num_output_placeholders,
                 )
             ):
+                req_index += 1
+                continue
+
+            if request.hybrid_plan is not None and request.hybrid_step_pending:
+                # holes/M: at most one outstanding replay step per request.
                 req_index += 1
                 continue
 
@@ -848,6 +858,7 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens - range_tokens(hole_pieces),
                         num_lookahead_tokens=self.num_lookahead_tokens,
                         hole_ranges=hole_pieces or None,
+                        defer_hole_caching=request.hybrid_plan is not None,
                     )
 
                     if new_blocks is not None:
@@ -888,6 +899,7 @@ class Scheduler(SchedulerInterface):
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_hole_ranges.pop(preempted_req_id, None)
+                            hybrid_steps.pop(preempted_req_id, None)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
@@ -926,6 +938,8 @@ class Scheduler(SchedulerInterface):
             if hole_pieces:
                 scheduled_hole_ranges[request_id] = hole_pieces
                 self._extra_segments += len(hole_pieces) - (n_tail == 0)
+            if request.hybrid_plan is not None:
+                self._record_hybrid_step(request, hole_pieces, hybrid_steps)
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
@@ -1049,6 +1063,19 @@ class Scheduler(SchedulerInterface):
                 hole_resume = hole_mode and request.num_computed_tokens > 0
                 hole_load_async = False
 
+                # holes/M: hybrid lookup (a plan or None = stock path).
+                hybrid_lookup = None
+                if (
+                    self.hybrid_holes_enabled
+                    and not hole_mode
+                    and request.num_computed_tokens == 0
+                    and request.num_output_tokens == 0
+                    and not request.has_encoder_inputs
+                ):
+                    hybrid_lookup = self.kv_cache_manager.get_computed_blocks_hybrid(
+                        request
+                    )
+
                 # Get already-cached tokens.
                 if hole_resume:
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
@@ -1097,6 +1124,16 @@ class Scheduler(SchedulerInterface):
                                 - range_tokens(load_ranges)
                             ),
                             num_external_cached_tokens=range_tokens(load_ranges),
+                        )
+                elif hybrid_lookup is not None:
+                    new_computed_blocks = hybrid_lookup.blocks
+                    num_new_local_computed_tokens = hybrid_lookup.plan.frontier
+                    num_computed_tokens = num_new_local_computed_tokens
+                    if request.prefill_stats and request.num_preemptions <= 0:
+                        request.prefill_stats.set(
+                            num_prompt_tokens=request.num_prompt_tokens,
+                            num_local_cached_tokens=hybrid_lookup.num_local_cached_tokens,
+                            num_external_cached_tokens=0,
                         )
                 elif request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
@@ -1256,6 +1293,20 @@ class Scheduler(SchedulerInterface):
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
                     break
+                elif hybrid_lookup is not None:
+                    # holes/M: first chunk of the first replay span; the tail
+                    # follows only after the last span (one span per forward).
+                    request.pending_hole_ranges = list(hybrid_lookup.plan.spans)
+                    request.hybrid_plan = hybrid_lookup.plan
+                    hole_pieces, n_tail = self._plan_hybrid_chunk(
+                        request,
+                        min(token_budget, input_budget - draft_slots),
+                    )
+                    num_new_tokens = range_tokens(hole_pieces)
+                    if num_new_tokens == 0:
+                        request.pending_hole_ranges = []
+                        request.hybrid_plan = None
+                        break
                 elif new_holes:
                     # holes/core: holes front first, then the tail (5.2 rules).
                     request.pending_hole_ranges = new_holes
@@ -1404,6 +1455,12 @@ class Scheduler(SchedulerInterface):
                     )
 
                 reserved_blocks = 0
+                if hybrid_lookup is not None:
+                    # Sources to protect and private SWA pages are part of
+                    # the admission transaction.
+                    reserved_blocks = self.kv_cache_manager.hybrid_extra_blocks(
+                        request, hybrid_lookup
+                    )
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
@@ -1438,16 +1495,23 @@ class Scheduler(SchedulerInterface):
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                     hole_ranges=hole_pieces or None,
+                    defer_hole_caching=hybrid_lookup is not None,
                 )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if hybrid_lookup is not None:
+                        request.hybrid_plan = None
+                        request.pending_hole_ranges = []
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                if hybrid_lookup is not None:
+                    self.kv_cache_manager.acquire_hybrid(request, hybrid_lookup)
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1504,6 +1568,10 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens
                         - range_tokens(new_holes)
                         - range_tokens(load_ranges),
+                    )
+                elif hybrid_lookup is not None:
+                    self.kv_cache_manager.record_prefix_cache_stats(
+                        request, hybrid_lookup.num_local_cached_tokens
                     )
                 elif did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
@@ -1577,6 +1645,12 @@ class Scheduler(SchedulerInterface):
                     if hole_pieces:
                         scheduled_hole_ranges[request_id] = hole_pieces
                         self._extra_segments += len(hole_pieces) - (n_tail == 0)
+                if hybrid_lookup is not None:
+                    self._hybrid_plan_seq += 1
+                    request.hybrid_plan_id = self._hybrid_plan_seq
+                    request.hybrid_completed = []
+                    scheduled_hole_ranges[request_id] = hole_pieces
+                    self._record_hybrid_step(request, hole_pieces, hybrid_steps)
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -1722,6 +1796,7 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
             scheduled_hole_ranges=scheduled_hole_ranges,
+            hybrid_replay_steps=hybrid_steps,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1758,6 +1833,107 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
+    def _hybrid_holes_effective(self, vllm_config: VllmConfig) -> bool:
+        """holes/M: the shared capability result for hybrid (multi-group)
+        holes. Needs the manager-level support, the V1 runner, no EAGLE, Full
+        and sliding-window groups only (Mamba state restore is not wired
+        yet) and the L2 rate connector (no connector = no hybrid holes, M
+        note U4; ``holes.test_hooks`` lifts the connector requirement for
+        CPU tests only)."""
+        kvm = self.kv_cache_manager
+        if not kvm.hybrid_holes_enabled:
+            return False
+        reason = None
+        if self.use_eagle:
+            reason = "EAGLE/MTP is outside hybrid holes."
+        elif self.use_v2_model_runner:
+            reason = "the V2 model runner does not support holes yet."
+        elif "mamba" in (kvm.coordinator.hybrid_kinds or []):  # type: ignore[attr-defined]
+            reason = "Mamba state restore is not implemented yet."
+        elif self.connector is None:
+            if not self.hole_config.test_hooks:
+                reason = "hybrid holes need the CPU offload connector with the rate policy."
+        else:
+            ktc = vllm_config.kv_transfer_config
+            allowed, why = connector_allows_holes(
+                self.connector, ktc.kv_connector_extra_config if ktc else None
+            )
+            if not allowed:
+                reason = why
+        if reason:
+            logger.warning("Hybrid holes disabled: %s", reason)
+            return False
+        return True
+
+    def _plan_hybrid_chunk(
+        self, request: Request, token_budget: int
+    ) -> tuple[list[tuple[int, int]], int]:
+        """holes/M: the next chunk of the current replay span (one contiguous
+        span per forward). A cut inside a span falls on the common block
+        boundary of all groups; the tail comes only after the last span."""
+        if not request.pending_hole_ranges:
+            return [], 0
+        a, e = request.pending_hole_ranges[0]
+        k = min(e - a, token_budget)
+        if k < e - a:
+            unit = self.kv_cache_manager.coordinator.hybrid_cut_unit  # type: ignore[attr-defined]
+            k -= k % unit
+        return ([(a, a + k)] if k > 0 else []), 0
+
+    def _record_hybrid_step(
+        self,
+        request: Request,
+        hole_pieces: list[tuple[int, int]],
+        steps: dict[str, HybridReplayStep],
+    ) -> None:
+        """holes/M: attach the replay step (or the tail's row restore) of a
+        request that carries a hybrid plan to this scheduler output."""
+        kvm = self.kv_cache_manager
+        plan = request.hybrid_plan
+        request.hybrid_step_id += 1
+        if hole_pieces:
+            a, b = hole_pieces[0]
+            idx = next(i for i, (s, e) in enumerate(plan.spans) if s <= a < e)
+            restore = a == plan.spans[idx][0] and plan.span_restore[idx]
+            steps[request.request_id] = kvm.hybrid_replay_step(
+                request, request.hybrid_plan_id, request.hybrid_step_id, a, b, restore
+            )
+            request.hybrid_step_pending = True
+        else:
+            steps[request.request_id] = kvm.hybrid_tail_step(
+                request,
+                request.hybrid_plan_id,
+                request.hybrid_step_id,
+                request.num_computed_tokens,
+                plan.tail_restore,
+            )
+            # The worker's rows are real again in this step; the sources and
+            # private pages are no longer read.
+            self._free_cow_retained_blocks(
+                kvm.release_hybrid(request.request_id)[::-1], self.sched_step_seq
+            )
+            request.hybrid_plan = None
+
+    def _complete_hybrid_step(self, request: Request, step: HybridReplayStep) -> None:
+        """holes/M: a replay step's output arrived: publish the completed
+        pages (completion-driven) and release the per-request fence."""
+        if (
+            request.hybrid_plan is None
+            or step.plan_id != request.hybrid_plan_id
+            or step.step_id != request.hybrid_step_id
+        ):
+            return  # stale output of a cancelled plan
+        request.hybrid_step_pending = False
+        done = sorted(request.hybrid_completed + [(step.start, step.end)])
+        merged: list[tuple[int, int]] = []
+        for s_, e_ in done:
+            if merged and s_ <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e_))
+            else:
+                merged.append((s_, e_))
+        request.hybrid_completed = merged
+        self.kv_cache_manager.cache_hole_blocks(request, merged)
+
     def _plan_hole_step(
         self,
         request: Request,
@@ -1768,6 +1944,8 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[list[tuple[int, int]], int]:
         """holes/core: pick the hole pieces and tail tokens of a request with
         pending holes for this step (KERNEL-ALGO 5.2)."""
+        if request.hybrid_plan is not None:
+            return self._plan_hybrid_chunk(request, token_budget)
         cfg = self.hole_config
         budget = token_budget
         if cfg.step_budget > 0:
@@ -1839,6 +2017,9 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         request.pending_hole_ranges = []
         request.pending_load_ranges = []
+        request.hybrid_plan = None
+        request.hybrid_step_pending = False
+        request.hybrid_completed = []
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2359,6 +2540,11 @@ class Scheduler(SchedulerInterface):
             # Drop-mode stale output (same-step resume) is discarded entirely.
             if output_is_stale and request.drop_stale_output:
                 continue
+
+            hstep = scheduler_output.hybrid_replay_steps.get(req_id)
+            if hstep is not None and not output_is_stale and hstep.end > hstep.start:
+                # holes/M: a replay span step finished (receipt by identity).
+                self._complete_hybrid_step(request, hstep)
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (

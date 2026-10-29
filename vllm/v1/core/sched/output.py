@@ -250,6 +250,9 @@ class HybridReplayStep:
     replacement_rows: dict[int, list[int]] = field(default_factory=dict)
     state_sources: dict[int, list[int]] = field(default_factory=dict)
     state_dests: dict[int, list[int]] = field(default_factory=dict)
+    # gid -> token ranges of the span whose KV is already retained (shared,
+    # cached cells): their cache writes are suppressed (negative slots).
+    no_write: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
 
 
 @dataclass
