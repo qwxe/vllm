@@ -314,3 +314,28 @@ Files changed (all under /home/asd/vllm-port):
 Escalations: none. Rule use: phase-1 not active. Not verified: all runtime and
 independent-review items in the could-not-check section. There are no commits
 from this call; every fix remains unstaged in the working tree for the caller.
+
+## v0.32.0 test adaptation (2026-10-29, T20261029-fork-test-adapt)
+
+Branch port/v0.32.0/holes-tests from port/v0.32.0/holes-rate (cc9962905). Mechanical API changes only; no
+assertion or expected value changed, no test deleted, skipped or loosened.
+
+| File:line | Old | New | Why |
+|---|---|---|---|
+| tests/v1/holes/test_rate_eviction.py:76 | `b.block_hash = h` | `b.set_block_hash(h)` | v0.32.0 `KVCacheBlock.block_hash` is a read-only property over `_block_hash`; `set_block_hash(block_hash, num_tokens=None)` (vllm/v1/core/kv_cache_utils.py:210) is the setter. `num_tokens` stays None: the old code set only the hash, and the helper's blocks are fresh (no hash yet), so the setter's assertion holds. |
+| tests/v1/holes/gpu_holes_e2e.py:61-62 | `def schedule_spy():` / `out = orig()` | `def schedule_spy(*args, **kwargs):` / `out = orig(*args, **kwargs)` | v0.32.0 `Scheduler.schedule(self, throttle_prefills=False)` (vllm/v1/core/sched/scheduler.py:635) is called with an argument; the spy forwards it unchanged. |
+
+Added test (loosens nothing): tests/v1/holes/gpu_holes_onoff_e2e.py, two engines in sequence (child processes),
+holes off (stock prefix caching, LRU) vs holes on (rate policy), same small pool (`num_gpu_blocks_override` 240,
+max_model_len 3584), bf16, greedy, 4 sessions x 4 turns run one request at a time; requires exact token equality
+of every request and at least one scheduled hole range in the on arm (else FAIL as vacuous).
+
+Results on the RTX 4050 (Qwen/Qwen2.5-0.5B-Instruct rev 7ae557604adf67be50417f59c2c2f167def9a775, --eager):
+
+- `pytest tests/v1/holes -q -p no:cacheprovider`: before 37 passed / 6 failed (exit 1); after 43 passed (exit 0).
+- `HOLES_MODEL=$Q python gpu_holes_e2e.py --eager`: exit 0, `RESULT PASS`; tokens_equal True in all 8 cases
+  (mid_hole, front_hole, two_holes, big_hole_chunked, tail_1tok, batch_a/b/c); bf16 gate unchanged (logprob limit
+  0.5010 from stock noise 0.2500, prefill counts all equal to expected).
+- `TEST_MODEL=$Q python gpu_rate_e2e.py calib --out DIR`: exit 0, cost fit A=0.02563 b1=1.029e-4 b2=2.655e-8.
+- `HOLES_MODEL=$Q python gpu_holes_onoff_e2e.py --eager`: exit 0, `RESULT PASS`; tokens_equal 16/16, on arm
+  2 holed requests, 2 hole steps, 2048 hole tokens, 99 groups evicted (idle).

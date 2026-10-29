@@ -73,7 +73,7 @@ class PoolHarness:
             if cached:
                 self._n += 1
                 h = make_block_hash_with_group_id(BlockHash(b"h%d" % self._n), 0)
-                b.block_hash = h
+                b.set_block_hash(h)
                 self.pool.cached_block_hash_to_block.insert(h, b)
         return table
 

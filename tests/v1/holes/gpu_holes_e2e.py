@@ -58,8 +58,8 @@ def main():
     log = []
     orig = sched.schedule
 
-    def schedule_spy():
-        out = orig()
+    def schedule_spy(*args, **kwargs):
+        out = orig(*args, **kwargs)
         log.append(
             (dict(out.num_scheduled_tokens), {k: list(v) for k, v in out.scheduled_hole_ranges.items()})
         )
