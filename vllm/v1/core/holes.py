@@ -241,6 +241,22 @@ def plan_step(
 
 
 @dataclass(frozen=True)
+class HybridResidency:
+    """What the hybrid lookup found for one request (planner input).
+
+    ``full_missing``: per Full attention group batch, token ranges whose page
+    is not retained (after ``min_reuse_blocks``). ``state_groups``: per
+    Mamba/SWA group batch, the boundaries (> 0) at which that group has its
+    exact state. ``frontiers``: candidate reuse boundaries (all group block
+    sizes divide them; 0 included).
+    """
+
+    full_missing: list[list[Range]]
+    state_groups: list[set[int]]
+    frontiers: list[int]
+
+
+@dataclass(frozen=True)
 class HybridReplayPlan:
     """Request-local plan of a hybrid request with a reuse frontier.
 

@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.holes import (
+    HybridResidency,
+    apply_min_reuse,
+    hits_to_holes,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     eagle_proof_margin,
     partial_hash_hits_enabled,
+    resolve_block_hashes,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -985,6 +992,57 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
+
+    def hybrid_residency(
+        self,
+        block_hashes: list[BlockHash],
+        num_tokens: int,
+        min_reuse_blocks: int = 1,
+    ) -> HybridResidency:
+        """holes/M: scan every group independently, without allocation or
+        stats side effects (M section 4 steps 2-3). Groups are recognised by
+        their manager type, never by group id. The last token is never
+        reusable, so everything is capped at ``num_tokens - 1``."""
+        from math import lcm
+
+        limit = num_tokens - 1
+        step = lcm(*(m.block_size for m in self.single_type_managers))
+        frontiers = list(range(0, limit + 1, step))
+        full_missing: list[list[tuple[int, int]]] = []
+        state_groups: list[set[int]] = []
+        for spec, group_ids, manager_cls, _use_eagle in self.attention_groups:
+            mgr = self.single_type_managers[group_ids[0]]
+            if type(mgr) is FullAttentionManager:
+                bs = mgr.block_size
+                hashes = resolve_block_hashes(
+                    block_hashes, self.hash_block_size, bs
+                )
+                n = limit // bs
+                hit = [
+                    bool(mgr.block_pool.get_cached_block(h, group_ids))
+                    for h in itertools.islice(hashes, n)
+                ]
+                hit = apply_min_reuse(hit, min_reuse_blocks)
+                hit += [False] * (n - len(hit))
+                full_missing.append(hits_to_holes(hit, bs))
+            else:
+                ok: set[int] = set()
+                for c in frontiers[1:]:
+                    _, hit_len = manager_cls.find_longest_cache_hit(
+                        block_hashes=block_hashes,
+                        max_length=c,
+                        kv_cache_group_ids=group_ids,
+                        block_pool=mgr.block_pool,
+                        kv_cache_spec=spec,
+                        drop_eagle_block=False,
+                        alignment_tokens=self._cache_hit_alignment_tokens,
+                        dcp_world_size=mgr.dcp_world_size,
+                        pcp_world_size=mgr.pcp_world_size,
+                    )
+                    if hit_len == c:  # exactly C, an older result is no proof
+                        ok.add(c)
+                state_groups.append(ok)
+        return HybridResidency(full_missing, state_groups, frontiers)
 
     def find_longest_cache_hit_per_group(
         self,
