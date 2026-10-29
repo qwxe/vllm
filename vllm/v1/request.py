@@ -190,6 +190,11 @@ class Request:
         # holes/L2: ranges a parked request waits for the connector to load
         # (WAITING_FOR_REMOTE_KVS); the blocks are cached only once loaded.
         self.pending_load_ranges: list[tuple[int, int]] = []
+        # holes/M stage 4: a parked hybrid request's L2 Full-page loads per KV
+        # group (published at completion; the plan is re-derived afterwards),
+        # and the pages whose load failed (not asked of L2 again).
+        self.hybrid_pending_loads: dict[int, list[tuple[int, int]]] = {}
+        self.hybrid_load_failed: dict[int, set[int]] = {}
         # holes/M: request-local hybrid replay plan (default absent). While it
         # runs, num_computed_tokens stays the logical frontier C; the actual
         # executed progress is hybrid_span_idx / hybrid_span_done. At most one

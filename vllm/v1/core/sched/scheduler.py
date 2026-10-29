@@ -1072,8 +1072,16 @@ class Scheduler(SchedulerInterface):
                     and request.num_output_tokens == 0
                     and not request.has_encoder_inputs
                 ):
+                    ext_hit: dict[int, list[bool]] | None = None
+                    if isinstance(self.connector, SupportsBlockHitMask):
+                        # M 7.2 rule 1: L2 is an additional source for the
+                        # Full pages the GPU lost (per Full group).
+                        ext_hit, deferred = self._hybrid_ext_hit(request)
+                        if deferred:
+                            skip_request(request_queue)
+                            continue
                     hybrid_lookup = self.kv_cache_manager.get_computed_blocks_hybrid(
-                        request
+                        request, ext_hit
                     )
 
                 # Get already-cached tokens.
@@ -1129,11 +1137,19 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = hybrid_lookup.blocks
                     num_new_local_computed_tokens = hybrid_lookup.plan.frontier
                     num_computed_tokens = num_new_local_computed_tokens
+                    # M 7.2 rule 4: L2 loads are asynchronous; the request
+                    # parks with the plan not started (re-derived on resume).
+                    load_kv_async = bool(hybrid_lookup.load_ranges)
+                    # Rule 6: external = L2-loaded tokens (largest group).
+                    num_hybrid_external = max(
+                        (range_tokens(rs) for rs in hybrid_lookup.load_ranges.values()),
+                        default=0,
+                    )
                     if request.prefill_stats and request.num_preemptions <= 0:
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=hybrid_lookup.num_local_cached_tokens,
-                            num_external_cached_tokens=0,
+                            num_external_cached_tokens=num_hybrid_external,
                         )
                 elif request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
@@ -1287,7 +1303,11 @@ class Scheduler(SchedulerInterface):
                 hole_pieces = []
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
-                    assert num_external_computed_tokens > 0 or load_ranges
+                    assert (
+                        num_external_computed_tokens > 0
+                        or load_ranges
+                        or hybrid_lookup is not None
+                    )
                     num_new_tokens = 0
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
@@ -1457,7 +1477,7 @@ class Scheduler(SchedulerInterface):
                     )
 
                 reserved_blocks = 0
-                if hybrid_lookup is not None:
+                if hybrid_lookup is not None and not load_kv_async:
                     # All-hit-first: protect the replay sources now, before
                     # the admission allocates anything; the private SWA pages
                     # are reserved in the admission check.
@@ -1514,14 +1534,29 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
-                if hybrid_lookup is not None:
+                if hybrid_lookup is not None and not load_kv_async:
                     self.kv_cache_manager.acquire_hybrid(request, hybrid_lookup)
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
                 # needed for this request.
-                if self.connector is not None and hole_mode:
+                if (
+                    self.connector is not None
+                    and hybrid_lookup is not None
+                    and load_kv_async
+                ):
+                    # holes/M stage 4: one load job over all groups into the
+                    # blocks just allocated; published at completion.
+                    request.hybrid_pending_loads = {
+                        g: list(rs) for g, rs in hybrid_lookup.load_ranges.items()
+                    }
+                    self.connector.update_state_after_alloc_with_ranges(  # type: ignore[union-attr]
+                        request,
+                        self.kv_cache_manager.get_blocks(request_id),
+                        hybrid_lookup.load_ranges,
+                    )
+                elif self.connector is not None and hole_mode:
                     # holes/core: the connector loads block ranges into the
                     # blocks allocated in place; they are cached now (sync
                     # load before the forward, as for stock external tokens).
@@ -3644,6 +3679,49 @@ class Scheduler(SchedulerInterface):
         request.replay_start = num_hit_tokens - num_replay_tokens
         return num_replay_tokens
 
+    def _hybrid_ext_hit(
+        self, request: Request
+    ) -> tuple[dict[int, list[bool]] | None, bool]:
+        """holes/M stage 4: per Full group, the pages L2 can load (the pages
+        the GPU lost). Returns (mask or None when nothing is held, deferred):
+        a pending or retried connector lookup defers the request. Pages whose
+        earlier load failed are not asked again."""
+        assert isinstance(self.connector, SupportsBlockHitMask)
+        ext_hit: dict[int, list[bool]] = {}
+        local = self.kv_cache_manager.hybrid_local_hits(request)
+        for gid, lh in local.items():
+            mask, _ = self.connector.get_block_hit_mask(request, lh, gid)
+            if mask is None:
+                return None, True
+            bad = request.hybrid_load_failed.get(gid)
+            if bad:
+                mask = [m and i not in bad for i, m in enumerate(mask)]
+            if any(mask):
+                ext_hit[gid] = mask
+        return (ext_hit or None), False
+
+    def _finish_hybrid_load(self, request: Request, load_failed: bool) -> None:
+        """holes/M stage 4 (M 7.2 rules 4-5): the L2 load of a parked hybrid
+        request ended. Loaded Full pages are published (valid K/V); failed
+        ones are remembered and never published. The request then gives back
+        its blocks and is looked up afresh, so the plan is re-derived from
+        the observed residency (loaded pages are GPU hits now; a failed page
+        is an ordinary hole, or the plan falls back to an earlier frontier)."""
+        loads = request.hybrid_pending_loads
+        request.hybrid_pending_loads = {}
+        coord = self.kv_cache_manager.coordinator
+        for gid, ranges in loads.items():
+            if load_failed:
+                bs = coord.single_type_managers[gid].block_size
+                request.hybrid_load_failed.setdefault(gid, set()).update(
+                    p for s, e in ranges for p in range(s // bs, e // bs)
+                )
+            elif self.kv_cache_manager.enable_caching:
+                coord.single_type_managers[gid].cache_hole_blocks(request, ranges)
+        self.kv_cache_manager.free(request)
+        self._inflight_prefills.discard(request)
+        request.num_computed_tokens = 0
+
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """KV Connector: update request state after async recv is finished.
 
@@ -3654,6 +3732,11 @@ class Scheduler(SchedulerInterface):
         assert self.connector is not None
 
         load_failed = request.request_id in self.failed_recving_kv_req_ids
+        if request.hybrid_pending_loads:
+            self._finish_hybrid_load(request, load_failed)
+            self.failed_recving_kv_req_ids.discard(request.request_id)
+            self.finished_recving_kv_req_ids.remove(request.request_id)
+            return
         if load_failed:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks

@@ -1074,6 +1074,24 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 state_groups.append(ok)
         return HybridResidency(full_missing, state_groups, frontiers)
 
+    def hybrid_local_hits(
+        self, block_hashes: list[BlockHash], num_tokens: int
+    ) -> dict[int, list[bool]]:
+        """holes/M stage 4: per Full group id, which pages (below
+        ``num_tokens - 1``) are cached on the GPU. Input of the connector's
+        per-group block-hit mask. No side effects."""
+        out: dict[int, list[bool]] = {}
+        for gid in self.hole_group_ids:
+            mgr = self.single_type_managers[gid]
+            bs = mgr.block_size
+            hashes = resolve_block_hashes(block_hashes, self.hash_block_size, bs)
+            n = (num_tokens - 1) // bs
+            out[gid] = [
+                bool(mgr.block_pool.get_cached_block(h, [gid]))
+                for h in itertools.islice(hashes, n)
+            ]
+        return out
+
     @staticmethod
     def _page_covered(mgr, h, group_ids, i, ext_hit) -> bool:
         for gid in group_ids:

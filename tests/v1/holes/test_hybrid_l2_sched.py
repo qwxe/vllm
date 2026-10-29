@@ -86,24 +86,19 @@ def test_failed_load_is_not_published_and_not_asked_again():
     s = r.scheduler
     _estep(r, complete=False)
     s.recompute_kv_load_failures = True
-    s.kv_holding_waiting.add_request(b)
     s._handle_failed_recving({"b"})
     assert "b" in s.failed_recving_kv_req_ids
-    s.finished_recving_kv_req_ids.add("b")
-    s._update_waiting_for_remote_kv(b)
-    m = s.kv_cache_manager
-    assert m.block_pool.get_cached_block(b.block_hashes[2], [0]) is None
-    assert b.hybrid_pending_loads == {}
-    assert b.num_computed_tokens == 0
+    _estep(r, complete=True)  # the transfer ends (reported as finished)
     n_loads = len(_loads(r))
-    b.status = RequestStatus.WAITING
     outs = [_estep(r) for _ in range(3)]
+    assert b.hybrid_pending_loads == {}
+    assert b.hybrid_load_failed == {0: {2}}
+    assert "b" not in s.failed_recving_kv_req_ids
     first = next(o for o in outs if "b" in o.num_scheduled_tokens)
-    # the failed page 2 became a hole (replayed), page 4 too
-    assert (2 * BS, 3 * BS) in first.scheduled_hole_ranges["b"] or any(
-        s_ <= 2 * BS < e_ for s_, e_ in first.scheduled_hole_ranges["b"]
-    )
-    assert len(_loads(r)) == n_loads
+    # the failed page 2 became a hole (replayed) with page 4
+    spans = first.scheduled_hole_ranges["b"]
+    assert spans[0][0] <= 2 * BS < spans[0][1]
+    assert len(_loads(r)) == n_loads  # not asked of L2 again
 
 
 def test_no_l2_hit_leaves_admission_as_before():

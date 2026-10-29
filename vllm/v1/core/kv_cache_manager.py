@@ -604,6 +604,12 @@ class KVCacheManager:
             },
         )
 
+    def hybrid_local_hits(self, request: Request) -> dict[int, list[bool]]:
+        """holes/M stage 4: GPU residency per Full group (see the coordinator)."""
+        return self.coordinator.hybrid_local_hits(  # type: ignore[attr-defined]
+            request.block_hashes, request.num_tokens
+        )
+
     def get_computed_blocks_hybrid(
         self, request: Request, ext_hit: dict[int, list[bool]] | None = None
     ) -> "HybridLookup | None":
