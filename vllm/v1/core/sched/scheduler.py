@@ -1853,6 +1853,16 @@ class Scheduler(SchedulerInterface):
             reason = "EAGLE/MTP is outside hybrid holes."
         elif self.use_v2_model_runner:
             reason = "the V2 model runner does not support holes yet."
+        elif vllm_config.speculative_config is not None:
+            reason = "speculative decoding is outside hybrid holes (M 7)."
+        elif (
+            vllm_config.parallel_config.tensor_parallel_size > 1
+            or vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            reason = (
+                "tensor/pipeline parallelism (TP>1 or PP>1) is outside hybrid "
+                "holes (M 7)."
+            )
         elif self.connector is None:
             if not self.hole_config.test_hooks:
                 reason = "hybrid holes need the CPU offload connector with the rate policy."

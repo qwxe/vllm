@@ -1201,9 +1201,12 @@ class OffloadingConnectorScheduler:
             # Admission: chunks below the first uncomputed hole are hits or
             # loads; the holes and what lies behind them are offered once
             # their blocks are computed (see _build_store_jobs).
-            for gid in sorted({0, *by_group}):
-                group_config = self.config.kv_group_configs[gid]
-                group_state = req_status.group_states[gid]
+            admitted = {0, *by_group}  # KV group indices, not positions
+            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                if group_config.group_idx not in admitted:
+                    continue
                 bs = group_config.tokens_per_block
                 self._current_batch_allocated_block_ids.update(
                     block.block_id
