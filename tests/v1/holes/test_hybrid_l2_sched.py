@@ -107,3 +107,15 @@ def test_no_l2_hit_leaves_admission_as_before():
     assert out.scheduled_hole_ranges["b"][0] == (2 * BS, 3 * BS)
     assert b.hybrid_pending_loads == {}
     assert _loads(r) == []
+
+
+def test_parked_request_runs_to_completion_after_the_load():
+    r, a, b = _l2_hybrid()
+    s = r.scheduler
+    for _ in range(14):
+        _estep(r)
+        if "b" not in s.requests:
+            break
+    assert "b" not in s.requests
+    assert b.hybrid_pending_loads == {} and b.hybrid_plan is None
+    assert len(_loads(r)) == 1  # one load job in total
