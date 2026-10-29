@@ -136,6 +136,7 @@ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilde
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
+    PAD_SLOT_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
@@ -210,7 +211,9 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.hole_segments import (
     HoleSegments,
+    apply_hybrid_replay_rows,
     build_hole_segments,
+    hybrid_write_suppress_indices,
     segment_common_attn_metadata,
 )
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -1510,6 +1513,13 @@ class GPUModelRunner(
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
+        # holes/M: install the execution rows of this step's replay steps
+        # (after condense, so request ids resolve to their final rows).
+        if scheduler_output.hybrid_replay_steps:
+            apply_hybrid_replay_rows(
+                self.input_batch, scheduler_output.hybrid_replay_steps
+            )
+
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
             update_ngram_gpu_tensors_incremental(
@@ -2191,6 +2201,18 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        if scheduler_output.hybrid_replay_steps:
+            # holes/M: retained cells of a replayed span keep their cached
+            # values: their cache writes are dropped (negative slots).
+            suppress = hybrid_write_suppress_indices(
+                scheduler_output.hybrid_replay_steps,
+                self.input_batch.req_ids,
+                self.query_start_loc.np[: num_reqs + 1],
+            )
+            for gid, idx in suppress.items():
+                self.input_batch.block_table[gid].slot_mapping.gpu[
+                    torch.from_numpy(idx).to(self.device)
+                ] = PAD_SLOT_ID
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2461,7 +2483,13 @@ class GPUModelRunner(
         if hole_segments is not None:
             # holes/core: one varlen entry per segment (KERNEL-ALGO (a)).
             assert ubatch_slices is None and num_reqs_padded == num_reqs
-            assert len(kv_cache_groups) == 1 and self.dcp_world_size == 1
+            # Multi-group (hybrid replay): every request has exactly one
+            # segment, so the group-0 view is the identity per request and the
+            # other groups take their own rows.
+            assert (
+                len(kv_cache_groups) == 1
+                or hole_segments.num_segments == num_reqs
+            ) and self.dcp_world_size == 1
             cm_base = segment_common_attn_metadata(cm_base, hole_segments, self.device)
 
         if self.dcp_world_size > 1:
