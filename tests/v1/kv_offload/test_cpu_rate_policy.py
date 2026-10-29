@@ -536,3 +536,67 @@ def test_swa_window_chunks_change_the_closure_of_a_node():
     three, kf3 = _swa_node(3)
     assert base.node_action_scores_for_test(kf[2]) == one.node_action_scores_for_test(kf[2])
     assert three.node_action_scores_for_test(kf3[2]) != base.node_action_scores_for_test(kf[2])
+
+
+# ---------------------------------------------------------------- fix round 1: L section 10 gaps (T8, T13)
+
+
+def _stock_trace(policy, hooks):
+    """Evicted keys and hit states of a fixed store/load script on a 3-chunk
+    pool; ``hooks`` adds the hole-era hand-offs, which stock policies ignore."""
+    mgr = CPUOffloadingManager(num_chunks=3, cache_policy=policy)
+    if hooks:
+        mgr.set_group_kinds(["full"], 1)
+        mgr.set_group_windows({0: 2})
+    trace = []
+    for n in range(7):
+        c = ctx(f"r{n}", f"s{n}")
+        mgr.on_new_request(c)
+        ks = [key(n * 2), key(n * 2 + 1)] if n % 2 == 0 else [key(n - 1), key(n * 2)]
+        for p, k in enumerate(ks):
+            c.set_offload_key_position(k, (p + 1) * T)
+        out = mgr.prepare_store(ks, c)
+        if out is not None:
+            trace.append((tuple(out.keys_to_store), tuple(out.evicted_keys)))
+            mgr.complete_store(out.keys_to_store, c)
+        else:
+            trace.append(None)
+        if hooks:
+            mgr.on_prefill_done(c)
+        trace.append(tuple(mgr.lookup(k, c).name for k in ks))
+        mgr.on_request_finished(c)
+    return trace
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_t8_stock_policies_keep_their_trace_with_the_hole_hooks(policy):
+    assert _stock_trace(policy, hooks=True) == _stock_trace(policy, hooks=False)
+
+
+def test_t13_rows_insert_eligibility_removal_and_remove():
+    clk = Clock()
+    pol = make_policy(clock=clk)
+    c = ctx("r", "s")
+    pol.on_request_arrival(c)
+    # insert: the key joins its node; the writer session becomes its reader
+    ks, chs = put_chain(pol, c, [1, 2], ready=False)
+    assert pol.node_layout_for_test() == {ks[1]: (tuple(ks), (), 0, 2 * T)}
+    # mark_evictable / mark_non_evictable: only ready, unreferenced keys are eligible
+    assert pol.evict(1, set()) is None
+    for k in ks:
+        chs[k].ref_cnt = 0
+        pol.mark_evictable(k)
+    pol.mark_non_evictable(ks[0])
+    chs[ks[0]].ref_cnt = 1
+    assert pol.evict(2, set()) is None  # the pinned front chunk blocks the node
+    chs[ks[0]].ref_cnt = 0
+    pol.mark_evictable(ks[0])
+    # evict removal: removed keys leave the node and an emptied node is dropped
+    ev = pol.evict(2, set())
+    assert sorted(k for k, _ in ev) == sorted(ks)
+    assert pol.node_layout_for_test() == {}
+    # remove(key): a failed store leaves the node as an eviction would
+    ks2, _ = put_chain(pol, c, [5, 6])
+    pol.remove(ks2[1])
+    assert pol.node_layout_for_test() == {ks2[0]: ((ks2[0],), (), 0, T)}
+    assert pol.get(ks2[1]) is None

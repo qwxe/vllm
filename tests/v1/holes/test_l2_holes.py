@@ -483,3 +483,12 @@ def test_l2_e2e_synthetic_workload_plan():
     assert peak <= 6
     assert len(plan["tool_gaps"]) == len(reqs) - 24 and all(g > 0 for g in plan["tool_gaps"])
     assert plan["p_end"] == 1 / 8
+
+
+def test_t10_untracked_request_prefill_done_is_a_no_op():
+    """L section 10 T10: a request the connector never saw (no on_new_request)
+    does not reach the manager."""
+    r = _runner(None)
+    unseen = U.make_request("unseen", [1, 2, 3])
+    r.scheduler_connector.connector_scheduler.on_prefill_done(unseen)
+    assert r.manager.on_prefill_done.call_count == 0

@@ -808,3 +808,25 @@ def test_scheduler_replay_chunk_respects_the_long_prefill_threshold():
     s.add_request(U.make_request("c", [5000 + i for i in range(40)]))
     out = s.schedule()
     assert out.hybrid_replay_steps["b"].end - out.hybrid_replay_steps["b"].start == 16
+
+
+def test_t10_hybrid_replay_step_does_not_signal_prefill_done():
+    """L section 10 T10: a replay-span step carries no sampled token, so the
+    prefill-done signal (connector and eviction policy) does not fire."""
+    from unittest.mock import MagicMock
+
+    r = _hyb_runner()
+    _prime_runner(r)
+    s = r.scheduler
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    s.add_request(b)
+    out = s.schedule()
+    assert out.hybrid_replay_steps["b"].end > out.hybrid_replay_steps["b"].start
+    s.connector = MagicMock()
+    s.eviction_policy = MagicMock()
+    mro = U.fake_output(out)
+    mro.sampled_token_ids = [[]]
+    s.update_from_output(out, mro)
+    s.connector.on_prefill_done.assert_not_called()
+    s.eviction_policy.on_prefill_done.assert_not_called()
