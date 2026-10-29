@@ -175,7 +175,7 @@ def run_arm(args):
 
         sched.connector.update_state_after_alloc_with_ranges = alloc
 
-    sp = SamplingParams(temperature=0.0, max_tokens=args.max_tokens, ignore_eos=True)
+    sp = SamplingParams(temperature=0.0, max_tokens=args.max_tokens, ignore_eos=True, logprobs=2)
     rng = random.Random(args.seed + 1)
     recs = []
     ctx: dict[int, list[int]] = {}
@@ -195,8 +195,12 @@ def run_arm(args):
         o = llm.generate([TokensPrompt(prompt_token_ids=prompt)], sp_s, use_tqdm=False)[0]
         dur = time.time() - t0
         out = list(o.outputs[0].token_ids)
+        gaps = []  # top-1 minus top-2 logprob of every generated position
+        for lp in o.outputs[0].logprobs or []:
+            v = sorted((x.logprob for x in lp.values()), reverse=True)
+            gaps.append(v[0] - v[1] if len(v) > 1 else float("inf"))
         recs.append({"session": s, "turn": r["turn"], "prompt": prompt, "out": out,
-                     "dur": dur, "cached": o.num_cached_tokens or 0})
+                     "gaps": gaps, "dur": dur, "cached": o.num_cached_tokens or 0})
         ctx[s] = prompt + out
     pol = None
     if ktc is not None:
@@ -271,7 +275,10 @@ def main():
         json.dump(params, f)
     print(f"sizing: peak_live_blocks={peak} longest={longest} gpu_blocks={gpu_blocks} "
           f"total_chunks={total_blocks} cpu_bytes={cpu_bytes} (synthetic workload)", flush=True)
-    common = ["--ref", ref_path, "--blocks", str(gpu_blocks), "--cpu-bytes", str(cpu_bytes),
+    # The small pool must hold one longest request (the engine checks it
+    # against max_model_len), so B-D run with max_model_len = longest + 16.
+    longest_tokens = max(len(r["prompt"]) + len(r["out"]) for r in recs) + BLOCK
+    common = ["--max-model-len", str(longest_tokens), "--ref", ref_path, "--blocks", str(gpu_blocks), "--cpu-bytes", str(cpu_bytes),
               "--params", params_path]
     for arm in ("B", "C", "D"):
         res[arm], _ = child(arm, common)
@@ -283,9 +290,16 @@ def main():
                if a["out"] != b["out"]]
         print(f"  {arm} policy={res[arm]['policy']} equal {len(recs) - len(bad)}/{len(recs)} "
               f"counters={res[arm]['counters']}")
+        for i in bad:
+            a, b = recs[i], res[arm]["requests"][i]
+            k = next((j for j, (x, y) in enumerate(zip(a["out"], b["out"])) if x != y), 0)
+            print(f"    {arm} request {i} (session {a['session']} turn {a['turn']}) first differs at "
+                  f"token {k}; A top1-top2 logprob gap {a['gaps'][k]:.3f}, {arm} gap "
+                  f"{b['gaps'][k]:.3f}; cached A={a['cached']} {arm}={b['cached']}")
         if arm == "C":
             if bad:
-                print(f"  C mismatching requests {bad[:10]} (check near-ties with logprobs)")
+                print(f"  C: {len(bad)} mismatching request(s): a near-tie divergence is "
+                      "checked with the logprob gaps above and is not a pass")
                 ok = False
             c = res["C"]["counters"]
             if c["l2_evicted"] == 0:
