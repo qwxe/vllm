@@ -794,3 +794,17 @@ def test_connector_hands_the_swa_window_width_to_the_manager():
     r.manager.set_group_windows.assert_called_once_with({1: 2})
     r2 = _hyb_runner(kinds=("full", "full"))
     r2.manager.set_group_windows.assert_not_called()
+
+
+def test_scheduler_replay_chunk_respects_the_long_prefill_threshold():
+    r = _hyb_runner()
+    _prime_runner(r)
+    s = r.scheduler
+    s.scheduler_config.long_prefill_token_threshold = 16
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    _evict_gpu(r, b, 3, 0)  # hole [32,64): 32 tokens, threshold 16
+    s.add_request(b)
+    s.add_request(U.make_request("c", [5000 + i for i in range(40)]))
+    out = s.schedule()
+    assert out.hybrid_replay_steps["b"].end - out.hybrid_replay_steps["b"].start == 16
