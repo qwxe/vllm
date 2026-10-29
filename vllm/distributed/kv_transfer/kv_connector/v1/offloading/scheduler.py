@@ -31,6 +31,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.eviction import session_id_of
 from vllm.v1.core.holes import (
+    HybridReplayPlan,
     get_hole_config,
     hybrid_completed_prefix,
     range_tokens,
@@ -1750,7 +1751,7 @@ class OffloadingConnectorScheduler:
                     # holes: blocks of an uncomputed hole are never offered.
                     num_tokens_after_batch = min(num_tokens_after_batch, holes[0][0])
                 plan = getattr(req, "hybrid_plan", None)
-                if plan is not None:
+                if isinstance(plan, HybridReplayPlan):
                     # holes/M (stage 4): only the contiguous completed replay
                     # range of a hybrid plan is valid KV.
                     num_tokens_after_batch = min(
