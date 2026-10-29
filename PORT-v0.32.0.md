@@ -449,3 +449,9 @@ Effective iff: manager-level support (prefix caching, supported groups, no EAGLE
 - Mamba execution (state restore into a private running state, explicit a/b in `mamba_utils`, Mamba attention metadata): the planner/residency/admission already treat Mamba groups, the scheduler gates them off.
 - Stage 4: L2 Full/SWA/Mamba sources (connector hole API is single-group, `kv_group_configs[0]`), one load job over all groups, store cap for hybrid, external stats, MultiConnector.
 - GPU: only the tiny dummy-weight Full+SWA model, eager, greedy bf16; no CUDA-graph run, no real checkpoint, no TP/PP.
+
+### Fix round 1 receipts (2026-10-30, head before the receipt commit: a7efc797e)
+
+- Hybrid GPU driver, committed code, RTX 4050, eager: `/home/asd/vllm-port-venv/bin/python tests/v1/holes/gpu_hybrid_e2e.py --eager` -> exit 0, `RESULT PASS (non-vacuous)`, counters replay_spans/no_write_tokens > 0 (44 s).
+- Mutation runs (temporary local patches, reverted, not committed): with the committed driver (`load_format=dummy`, uniform +-1e-3 weights) a replay-position shift (+7 after `compute_slot_mapping`) and a drop of every replay cache write both still gave `RESULT PASS (non-vacuous)`: the committed driver does NOT detect wrong replay positions or missing replay KV (code-r1 finding 10 confirmed). With the dummy weight range temporarily widened to +-0.3 (`initialize_single_dummy_weight`, also a local patch), the unmutated run passes (`RESULT PASS`, exit 0) and the position-shift mutation fails (exit 1, `RESULT FAIL (non-vacuous)`, mismatches `[(1,'restore'), (4,'full_hole'), (4,'earlier_state')]`, logprob gaps 0.004-0.008). So the driver can fail only with larger weights; the committed driver's PASS is a weak claim. Strengthening the driver (own weight scale) is not done here (needs a vllm-side or driver-side change; left to the manager).
+
