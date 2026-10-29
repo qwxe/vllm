@@ -277,6 +277,16 @@ class HybridReplayPlan:
         return range_tokens(list(self.spans)) + num_tokens - self.frontier
 
 
+@dataclass
+class HybridLookup:
+    """Result of the hybrid lookup of one request (holes/M)."""
+
+    plan: HybridReplayPlan
+    blocks: Any  # KVCacheBlocks at the plan frontier, null at Full hole pages
+    num_local_cached_tokens: int
+    num_hole_pages: int
+
+
 def _close_spans(
     full_missing: list[Range], state_ok: Any, frontier: int
 ) -> list[Range]:

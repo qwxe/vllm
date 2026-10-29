@@ -9,7 +9,15 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.holes import HoleConfig, Range, apply_min_reuse, hits_to_holes
+from vllm.v1.core.holes import (
+    HoleConfig,
+    HybridLookup,
+    Range,
+    apply_min_reuse,
+    hits_to_holes,
+    plan_hybrid_replay,
+    range_tokens,
+)
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -232,7 +240,20 @@ class KVCacheManager:
             and enable_caching
             and self.coordinator.supports_holes
         )
-        if self.hole_config.enabled and not self.holes_enabled:
+        # holes/M: hybrid (multi-group) holes; the single-group path above is
+        # unchanged. Whether they take effect also needs the L2 rate gate in
+        # the scheduler.
+        self.hybrid_holes_enabled = (
+            self.hole_config.enabled
+            and enable_caching
+            and not self.holes_enabled
+            and getattr(self.coordinator, "supports_hybrid_holes", False)
+        )
+        if (
+            self.hole_config.enabled
+            and not self.holes_enabled
+            and not self.hybrid_holes_enabled
+        ):
             logger.warning(
                 "Hole-aware prefix caching was requested but is not supported "
                 "for this configuration (needs prefix caching, a single "
@@ -364,6 +385,46 @@ class KVCacheManager:
             for i, h in enumerate(hit)
         ]
         return blocks, bs
+
+    def get_computed_blocks_hybrid(self, request: Request) -> "HybridLookup | None":
+        """holes/M: hybrid lookup. Returns None when the stock prefix path is
+        at least as good (or holes cannot apply to this request); otherwise
+        the plan and the per-group computed blocks at its frontier, with null
+        blocks at the Full hole pages. No allocation or stats side effects."""
+        assert self.hybrid_holes_enabled
+        if request.skip_reading_prefix_cache or request.num_tokens < 2:
+            return None
+        coord = self.coordinator
+        res = coord.hybrid_residency(  # type: ignore[attr-defined]
+            request.block_hashes,
+            request.num_tokens,
+            self.hole_config.min_reuse_blocks,
+        )
+        plan = plan_hybrid_replay(
+            request.num_tokens, res.full_missing, res.state_groups, res.frontiers
+        )
+        if plan is None:
+            return None
+        blocks = coord.hybrid_blocks_at(  # type: ignore[attr-defined]
+            request.block_hashes, plan.frontier
+        )
+        # Useful local hits: the frontier minus every executed token below it
+        # (whole-model replay counts as work even where Full K/V is resident).
+        executed = range_tokens(
+            [(s, min(e, plan.frontier)) for s, e in plan.spans]
+        )
+        hole_pages = sum(
+            1
+            for gid in coord.hole_group_ids  # type: ignore[attr-defined]
+            for b in blocks[gid]
+            if b.is_null
+        )
+        return HybridLookup(
+            plan=plan,
+            blocks=KVCacheBlocks(blocks),
+            num_local_cached_tokens=plan.frontier - executed,
+            num_hole_pages=hole_pages,
+        )
 
     def get_computed_blocks_with_holes(
         self,
@@ -701,9 +762,16 @@ class KVCacheManager:
         if num_hole_blocks > 0:
             # holes/core: touch the hits, allocate the hole blocks in place.
             assert num_external_computed_tokens == 0
-            self.coordinator.allocate_new_computed_blocks_with_holes(
-                request.request_id, new_computed_block_list
-            )
+            if self.hybrid_holes_enabled:
+                self.coordinator.allocate_hybrid_computed_blocks(  # type: ignore[attr-defined]
+                    request.request_id,
+                    new_computed_block_list,
+                    num_local_computed_tokens,
+                )
+            else:
+                self.coordinator.allocate_new_computed_blocks_with_holes(
+                    request.request_id, new_computed_block_list
+                )
         elif (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
@@ -749,6 +817,13 @@ class KVCacheManager:
         self, new_computed_block_list: tuple[Sequence[KVCacheBlock], ...]
     ) -> int:
         """holes/core: null blocks in a new request's hits are holes."""
+        if self.hybrid_holes_enabled and new_computed_block_list:
+            return sum(
+                1
+                for gid in self.coordinator.hole_group_ids  # type: ignore[attr-defined]
+                for b in new_computed_block_list[gid]
+                if b.is_null
+            )
         if not self.holes_enabled or not new_computed_block_list:
             return 0
         return sum(1 for b in new_computed_block_list[0] if b.is_null)

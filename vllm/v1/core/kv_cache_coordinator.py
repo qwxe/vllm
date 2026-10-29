@@ -9,6 +9,7 @@ from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.holes import (
     HybridResidency,
+    hybrid_group_kinds,
     apply_min_reuse,
     hits_to_holes,
 )
@@ -757,6 +758,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
+        # holes/M: hybrid hole support is a property of the resolved groups.
+        self.hybrid_kinds, self.hybrid_reason = hybrid_group_kinds(
+            self.single_type_managers
+        )
+        self.supports_hybrid_holes = (
+            enable_caching
+            and not use_eagle
+            and dcp_world_size == 1
+            and pcp_world_size == 1
+            and self.hybrid_kinds is not None
+        )
+        # Full groups (by manager type, not by id) hold the hole pages.
+        self.hole_group_ids: tuple[int, ...] = tuple(
+            i for i, k in enumerate(self.hybrid_kinds or []) if k == "full"
+        )
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -1043,6 +1059,69 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         ok.add(c)
                 state_groups.append(ok)
         return HybridResidency(full_missing, state_groups, frontiers)
+
+    def hybrid_blocks_at(
+        self, block_hashes: list[BlockHash], frontier: int
+    ) -> tuple[list[KVCacheBlock], ...]:
+        """holes/M: per-group computed blocks of a hybrid hit at ``frontier``:
+        what a stock prefix hit at the frontier would give, except that Full
+        pages that are not retained are null blocks (the holes). No side
+        effects."""
+        out: list[list[KVCacheBlock]] = [[] for _ in self.single_type_managers]
+        for spec, group_ids, manager_cls, _eagle in self.attention_groups:
+            mgr = self.single_type_managers[group_ids[0]]
+            if type(mgr) is FullAttentionManager:
+                bs = mgr.block_size
+                hashes = resolve_block_hashes(
+                    block_hashes, self.hash_block_size, bs
+                )
+                for h in itertools.islice(hashes, frontier // bs):
+                    hit = mgr.block_pool.get_cached_block(h, group_ids)
+                    for k, gid in enumerate(group_ids):
+                        out[gid].append(hit[k] if hit else mgr._null_block)
+            else:
+                blocks, hit_len = manager_cls.find_longest_cache_hit(
+                    block_hashes=block_hashes,
+                    max_length=frontier,
+                    kv_cache_group_ids=group_ids,
+                    block_pool=mgr.block_pool,
+                    kv_cache_spec=spec,
+                    drop_eagle_block=False,
+                    alignment_tokens=self._cache_hit_alignment_tokens,
+                    dcp_world_size=mgr.dcp_world_size,
+                    pcp_world_size=mgr.pcp_world_size,
+                )
+                assert hit_len == frontier, "state group lost its state"
+                for gid, blks in zip(group_ids, blocks):
+                    out[gid] = list(blks)
+        return tuple(out)
+
+    def allocate_hybrid_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_local_computed_tokens: int,
+    ) -> int:
+        """holes/M: admit a hybrid hit with Full holes. All-hit-first
+        protection: every group's hits are touched before any new block is
+        allocated; then state groups are added as for a stock hit and the Full
+        hole pages get fresh blocks in place. Returns the hole page count."""
+        holes = set(self.hole_group_ids)
+        for i in holes:
+            self.single_type_managers[i].block_pool.touch(
+                [b for b in new_computed_blocks[i] if not b.is_null]
+            )
+        for i, manager in enumerate(self.single_type_managers):
+            if i not in holes:
+                manager.add_local_computed_blocks(
+                    request_id, new_computed_blocks[i], num_local_computed_tokens, 0
+                )
+        n = 0
+        for i in sorted(holes):
+            n += self.single_type_managers[i].allocate_new_computed_blocks_with_holes(
+                request_id, new_computed_blocks[i], touch=False
+            )
+        return n
 
     def find_longest_cache_hit_per_group(
         self,

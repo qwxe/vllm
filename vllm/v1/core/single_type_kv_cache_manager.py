@@ -422,10 +422,13 @@ class SingleTypeKVCacheManager(ABC):
         self,
         request_id: str,
         new_computed_blocks: Sequence[KVCacheBlock],
+        touch: bool = True,
     ) -> int:
         """holes/core: add a new request's cache hits, where null blocks mark
         holes. Touches the hit blocks and allocates a fresh block in place of
         every hole block, so the block table stays position ordered.
+        ``touch=False``: the caller already touched the hits (hybrid
+        all-hit-first protection, holes/M).
 
         Returns the number of hole blocks allocated.
         """
@@ -435,7 +438,8 @@ class SingleTypeKVCacheManager(ABC):
         hits = [blk for blk in new_computed_blocks if not blk.is_null]
         hole_idx = [i for i, blk in enumerate(new_computed_blocks) if blk.is_null]
         assert self.enable_caching
-        self.block_pool.touch(hits)
+        if touch:
+            self.block_pool.touch(hits)
         fresh = self.block_pool.get_new_blocks(len(hole_idx)) if hole_idx else []
         req_blocks.extend(new_computed_blocks)
         for i, blk in zip(hole_idx, fresh):
