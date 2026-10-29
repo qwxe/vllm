@@ -2398,6 +2398,8 @@ class Scheduler(SchedulerInterface):
                 if self.eviction_policy is not None:
                     # holes/rate: the first sampled token ends the prefill.
                     self.eviction_policy.on_prefill_done(req_id)
+                if self.connector is not None:
+                    self.connector.on_prefill_done(request)
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
                 )

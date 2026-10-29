@@ -14,7 +14,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import RequestRunner
 def _runner(holes: dict | None, **kw) -> RequestRunner:
     add = {"holes": holes} if holes is not None else None
     return RequestRunner(
-        block_size=16, num_gpu_blocks=64, additional_config=add, **kw
+        block_size=16, num_gpu_blocks=400, additional_config=add, **kw
     )
 
 
@@ -72,7 +72,7 @@ def test_req_context_carries_the_session_id():
 
 
 def test_t10_prefill_done_fires_once_with_the_first_sampled_token():
-    r = _runner_with_request(prompt_len=40)
+    r = _runner_with_request(prompt_len=1200)
     _step(r, sample=False)  # a prefill chunk with no sampled token
     assert r.manager.on_prefill_done.call_count == 0
     _step(r)
@@ -83,7 +83,7 @@ def test_t10_prefill_done_fires_once_with_the_first_sampled_token():
 
 
 def test_t10_no_signal_for_a_request_that_samples_nothing_yet():
-    r = _runner_with_request(prompt_len=40)
-    for _ in range(2):
+    r = _runner_with_request(prompt_len=2500)
+    for _ in range(2):  # 1000 + 1000 of 2500 tokens: still prefilling
         _step(r, sample=False)
     assert r.manager.on_prefill_done.call_count == 0

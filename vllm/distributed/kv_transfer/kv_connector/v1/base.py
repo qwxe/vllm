@@ -603,6 +603,12 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def on_prefill_done(self, request: "Request") -> None:
+        """Called by the scheduler once when the request's first non-empty
+        sampled tokens arrive (its prefill is over). The default implementation
+        is a no-op."""
+        return
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """Update KVConnector state from worker-side connectors output.
 

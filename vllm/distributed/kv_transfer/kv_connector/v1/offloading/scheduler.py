@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
+from vllm.v1.core.eviction import session_id_of
 from vllm.v1.core.holes import get_hole_config
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -383,6 +384,8 @@ class RequestOffloadState:
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    # True once on_prefill_done has been signaled to the manager.
+    prefill_done_signaled: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -558,6 +561,7 @@ def _create_req_context(req: Request) -> ReqContext:
         kv_transfer_params=params,
         kv_hints=req.kv_hints,
         load_tier_filter=load_filter,
+        session_id=session_id_of(req),
     )
 
 
@@ -1047,6 +1051,15 @@ class OffloadingConnectorScheduler:
             offloading_context=offloading_context,
         )
         self._req_status[request.request_id] = req_status
+
+    def on_prefill_done(self, request: Request) -> None:
+        """The request's first non-empty sampled tokens arrived: its prefill
+        is over (holes/rate: session state for the L2 policy)."""
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None or req_status.prefill_done_signaled:
+            return
+        req_status.prefill_done_signaled = True
+        self.manager.on_prefill_done(req_status.req_context)
 
     def get_num_new_matched_tokens(
         self,
