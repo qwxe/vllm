@@ -333,7 +333,8 @@ scheduled hole range in the on arm, and at least one holed request with cached >
 otherwise FAIL as vacuous. Review r1 notes (2026-10-29): the first default of 4 sessions x 4 turns gave the off arm
 no prefix hits at all (cached 0 on every request, effectively a full-recompute reference), and holes occurred only
 sometimes (run 1: 2 holed requests; rerun: 0 holes, exit 1). The default became 2 sessions x 6 turns, where both
-arms reuse cached blocks and holes occur in the same way in repeated runs.
+arms reuse cached blocks; identical counts in 3 runs on this machine. Hole occurrence depends on wall-clock rate
+scores, so a run without holes FAILs as vacuous (false FAIL possible, false PASS not).
 
 Results on the RTX 4050 (Qwen/Qwen2.5-0.5B-Instruct rev 7ae557604adf67be50417f59c2c2f167def9a775, --eager):
 
@@ -345,9 +346,10 @@ Results on the RTX 4050 (Qwen/Qwen2.5-0.5B-Instruct rev 7ae557604adf67be50417f59
 - `HOLES_MODEL=$Q python gpu_holes_onoff_e2e.py --eager`, first default 4 sessions x 4 turns: run 1 exit 0,
   `RESULT PASS`, tokens_equal 16/16, 2 holed requests, 2048 hole tokens; rerun with the cached > 0 check: exit 1,
   `RESULT FAIL` (0 holes, vacuous; tokens_equal 16/16).
-- Same with `--sessions 2 --turns 6`, two runs: exit 0 both, `RESULT PASS`, tokens_equal 12/12, 6 holed requests,
+- Same with `--sessions 2 --turns 6`, two runs: `RESULT PASS` in both logs (no exit code recorded), tokens_equal 12/12, 6 holed requests,
   6 hole steps, 4864 hole tokens, holed requests' cached tokens [1712, 1456, 1424, 1168, 1392, 1136] (identical in
   both runs).
 - Final run with the new defaults (`HOLES_MODEL=$Q python gpu_holes_onoff_e2e.py --eager`): exit 0, `RESULT PASS`,
   tokens_equal 12/12, 6 holed requests, 4864 hole tokens, holed cached [1712, 1456, 1424, 1168, 1392, 1136].
-  Logs with exit codes: /home/asd/dl-overnight/logs/test-adapt/ (onoff-r1.log, onoff-s2t6-{1,2}.log, onoff-r1-final.log).
+  Logs: /home/asd/dl-overnight/logs/test-adapt/ (onoff-r1.log: exit 1 recorded; onoff-s2t6-{1,2}.log: no exit line;
+  onoff-r1-final.log: exit 0 recorded).
