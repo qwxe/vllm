@@ -87,3 +87,86 @@ def test_t10_no_signal_for_a_request_that_samples_nothing_yet():
     for _ in range(2):  # 1000 + 1000 of 2500 tokens: still prefilling
         _step(r, sample=False)
     assert r.manager.on_prefill_done.call_count == 0
+
+
+# ------------------------------------------------------------------ L commit 3: activation gate (T11)
+
+from vllm.distributed.kv_transfer.kv_connector.v1.hole_mask import (  # noqa: E402
+    SupportsBlockHitMask,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (  # noqa: E402
+    OffloadingConnector,
+)
+
+
+class _MaskOnly(SupportsBlockHitMask):
+    """A mask-capable connector that is not the CPU offload connector."""
+
+    def get_block_hit_mask(self, request, local_hit):
+        return None, False
+
+    def update_state_after_alloc_with_ranges(self, request, blocks, load_ranges):
+        return None
+
+
+class _L2Fake(OffloadingConnector, SupportsBlockHitMask):
+    """An OffloadingConnector that carries the mask API (as after commit 4)."""
+
+    def __init__(self):  # no real init: only isinstance matters here
+        pass
+
+    def get_block_hit_mask(self, request, local_hit):
+        return None, False
+
+    def update_state_after_alloc_with_ranges(self, request, blocks, load_ranges):
+        return None
+
+
+class _NoMask:
+    pass
+
+
+def connector_allows_holes(connector, extra):
+    from vllm.distributed.kv_transfer.kv_connector.v1.hole_mask import (
+        connector_allows_holes as gate,
+    )
+
+    return gate(connector, extra)
+
+
+@pytest.mark.parametrize(
+    "connector,extra,allowed",
+    [
+        (None, None, True),  # no connector: the existing path, unchanged
+        (_MaskOnly(), None, True),  # other mask-capable connectors: unchanged
+        (_NoMask(), None, False),
+        (_L2Fake(), {"eviction_policy": "rate"}, True),
+        (_L2Fake(), {"eviction_policy": "lru"}, False),
+        (_L2Fake(), {"eviction_policy": "arc"}, False),
+        (_L2Fake(), {}, False),  # absent = lru: holes + LRU is not a configuration
+        (_L2Fake(), None, False),
+    ],
+)
+def test_t11_activation_table(connector, extra, allowed):
+    ok, reason = connector_allows_holes(connector, extra)
+    assert ok is allowed
+    assert (reason is None) == allowed
+
+
+def test_t11_multiconnector_keeps_holes_off():
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiConnector,
+    )
+
+    mc = object.__new__(MultiConnector)  # not mask-capable in this stage [dep MC]
+    assert connector_allows_holes(mc, {"eviction_policy": "rate"})[0] is False
+
+
+@pytest.mark.parametrize("policy", [None, "lru", "arc", "rate"])
+def test_t11_scheduler_with_the_offload_connector_stays_off_until_the_mask_api(policy):
+    """Real scheduler + real OffloadingConnector over the mock spec: the
+    connector has no mask API yet in this stage, so holes stay off for every
+    policy (commit 4 turns them on for rate only)."""
+    extra = {"eviction_policy": policy} if policy else None
+    r = _runner({"enabled": True}, extra_config_overrides=extra)
+    assert r.scheduler.holes_enabled is False
