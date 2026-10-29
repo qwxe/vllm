@@ -27,10 +27,10 @@ Scheduler protocol (``Scheduler.schedule``, waiting requests, holes enabled):
    loaded external tokens, so the load must complete before the layer's
    attention runs (``start_load_kv`` / ``wait_for_layer_load``).
 
-Not supported yet (the scheduler falls back to treating connector-only blocks
-as misses): asynchronous loads (``load_async=True``), i.e. the
-WAITING_FOR_REMOTE_KVS path. The CPU-pool connector with the ``rate``
-eviction policy is a later deliverable; this file only fixes the interface.
+Asynchronous loads (``load_async=True``, the WAITING_FOR_REMOTE_KVS path) are
+accepted from the CPU offload connector (OffloadingConnector) only; for any
+other mask connector the scheduler treats them as misses. The CPU offload
+connector activates holes only with ``eviction_policy="rate"``.
 
 A connector that does not implement the mixin keeps prefix semantics: with
 such a connector configured, the scheduler uses the stock prefix-only lookup
@@ -85,3 +85,30 @@ class SupportsBlockHitMask(ABC):
             load_ranges: block-aligned token ranges to load into ``blocks``.
         """
         raise NotImplementedError
+
+
+def connector_allows_holes(connector: object | None, extra_config: dict | None):
+    """Whether holes may be effective with ``connector`` (scheduler side).
+
+    No connector: yes (the GPU holes path). The CPU OffloadingConnector: only
+    with the mask API and ``eviction_policy == "rate"`` (holes + LRU is not a
+    configuration). Any other connector: only if it implements
+    ``SupportsBlockHitMask``. MultiConnector, NIXL and Mooncake do not, so
+    holes stay off for them [dep MC]. Returns ``(allowed, reason)``.
+    """
+    if connector is None:
+        return True, None
+    if not isinstance(connector, SupportsBlockHitMask):
+        return False, (
+            f"KV connector {type(connector).__name__} does not implement "
+            "SupportsBlockHitMask."
+        )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+
+    if isinstance(connector, OffloadingConnector) and (extra_config or {}).get(
+        "eviction_policy"
+    ) != "rate":
+        return False, "OffloadingConnector holes need eviction_policy='rate'."
+    return True, None

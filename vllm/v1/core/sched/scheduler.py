@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.hole_mask import (
     SupportsBlockHitMask,
+    connector_allows_holes,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
@@ -397,17 +398,14 @@ class Scheduler(SchedulerInterface):
         if self.holes_enabled and self.use_v2_model_runner:
             logger.warning("Holes are not supported by the V2 model runner.")
             self.holes_enabled = False
-        if (
-            self.holes_enabled
-            and self.connector is not None
-            and not isinstance(self.connector, SupportsBlockHitMask)
-        ):
-            logger.warning(
-                "Holes disabled: KV connector %s does not implement "
-                "SupportsBlockHitMask.",
-                type(self.connector).__name__,
+        if self.holes_enabled and self.connector is not None:
+            ktc = vllm_config.kv_transfer_config
+            allowed, reason = connector_allows_holes(
+                self.connector, ktc.kv_connector_extra_config if ktc else None
             )
-            self.holes_enabled = False
+            if not allowed:
+                logger.warning("Holes disabled: %s", reason)
+                self.holes_enabled = False
         self._warned_async_mask = False
         self._step_hole_ranges: dict[str, list[tuple[int, int]]] = {}
         self._extra_segments = 0
