@@ -660,3 +660,63 @@ def test_write_suppression_indices_follow_the_flattened_batch():
     )
     assert idx[0].tolist() == list(range(5, 21))  # tokens of [16,32)
     assert idx[1].tolist() == list(range(29, 37))  # tokens of [40,48)
+
+
+def _out(s, out):
+    mro = U.fake_output(out)
+    mro.sampled_token_ids = [[] for _ in mro.req_ids]
+    s.update_from_output(out, mro)
+
+
+def test_scheduler_long_span_is_chunked_at_block_boundaries():
+    r = _hyb_runner()
+    _prime_runner(r)
+    s = r.scheduler
+    s.max_num_scheduled_tokens = 20
+    s.scheduler_config.max_num_batched_tokens = 20
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    _evict_gpu(r, b, 3, 0)  # hole [32,64)
+    s.add_request(b)
+    o1 = s.schedule()
+    st1 = o1.hybrid_replay_steps["b"]
+    assert (st1.start, st1.end, st1.restore) == (32, 48, True)
+    row1 = st1.replacement_rows[1]
+    m = s.kv_cache_manager
+    _out(s, o1)
+    # page 2 is complete and published, page 3 is not
+    assert m.block_pool.get_cached_block(b.block_hashes[2], [0]) is not None
+    assert m.block_pool.get_cached_block(b.block_hashes[3], [0]) is None
+    o2 = s.schedule()
+    st2 = o2.hybrid_replay_steps["b"]
+    assert (st2.start, st2.end, st2.restore) == (48, 64, False)  # continues
+    row2 = st2.replacement_rows[1]
+    # the window moved on: page 0 left it; sources and the private page are kept
+    assert row2[0] == 0 and row2[1:3] == row1[1:3] and len(row2) == 4
+    _out(s, o2)
+    assert m.block_pool.get_cached_block(b.block_hashes[3], [0]) is not None
+    o3 = s.schedule()
+    assert o3.num_scheduled_tokens["b"] == 7 and "b" not in o3.scheduled_hole_ranges
+
+
+def test_scheduler_preempt_or_abort_mid_replay_leaves_nothing_behind():
+    from vllm.v1.request import RequestStatus
+
+    r = _hyb_runner()
+    _prime_runner(r)
+    s = r.scheduler
+    m = s.kv_cache_manager
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    s.add_request(b)
+    o1 = s.schedule()
+    assert "b" in m._hybrid
+    s.finish_requests("b", RequestStatus.FINISHED_ABORTED)
+    assert "b" not in m._hybrid
+    # the in-flight output of the aborted request is ignored
+    _out(s, o1)
+    assert m.block_pool.get_cached_block(b.block_hashes[2], [0]) is None
+    # nothing is pinned any more
+    assert all(
+        blk.ref_cnt == 0 for blk in m.block_pool.blocks if not blk.is_null
+    )
