@@ -186,6 +186,18 @@ def test_hybrid_gate_admits_only_the_offloading_connector_rate_path():
     assert _hybrid_gate(_L2Fake(), {"eviction_policy": "lru"}) is False
 
 
+def test_hybrid_plus_l2_rate_path_stays_inert_until_stage_4(caplog):
+    # code-r1 finding 2, Q-A (a): hybrid holes with the OffloadingConnector
+    # rate path are gated off (warning, stock lookup) until stage 4 exists
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        assert _hybrid_gate(_L2Fake(), {"eviction_policy": "rate"}) is False
+    warns = [r for r in caplog.records if "Hybrid holes disabled" in r.getMessage()]
+    assert len(warns) == 1
+    assert "stage 4" in warns[0].getMessage()
+
+
 def test_t11_multiconnector_keeps_holes_off():
     from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
         MultiConnector,
