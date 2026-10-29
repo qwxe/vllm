@@ -615,3 +615,48 @@ def test_scheduler_replay_protects_sources_and_frees_everything():
     assert m.block_pool.get_num_free_blocks() >= free0 - 1  # hole page cached? no
     for g in m.coordinator.single_type_managers:
         assert "b" not in g.req_to_blocks or not g.req_to_blocks["b"]
+
+
+# ---- worker helpers: replacement rows and suppressed cache writes ----------
+
+
+def test_worker_applies_replacement_rows_by_request_id():
+    import types
+
+    from vllm.v1.core.sched.output import HybridReplayStep
+    from vllm.v1.worker.hole_segments import apply_hybrid_replay_rows
+
+    t = _tables()
+    t.add_row(([1, 2, 3], [10, 11, 12, 13]), 0)
+    t.add_row(([4, 5, 6], [20, 21]), 1)
+    batch = types.SimpleNamespace(
+        req_id_to_index={"x": 1, "y": 0}, block_table=t
+    )
+    steps = {
+        "x": HybridReplayStep("x", 1, 1, 16, 32, True, replacement_rows={1: [7, 8, 9]}),
+        "gone": HybridReplayStep("gone", 1, 1, 0, 16, False, replacement_rows={1: [1]}),
+    }
+    apply_hybrid_replay_rows(batch, steps)
+    g0, g1 = t.block_tables
+    assert list(g1.block_table.np[1, :4]) == [7, 8, 9, 0]  # row of x, shrunk
+    assert list(g1.block_table.np[0, :4]) == [10, 11, 12, 13]  # y untouched
+    assert list(g0.block_table.np[1, :3]) == [4, 5, 6]  # unchanged group
+
+
+def test_write_suppression_indices_follow_the_flattened_batch():
+    import numpy as np
+
+    from vllm.v1.core.sched.output import HybridReplayStep
+    from vllm.v1.worker.hole_segments import hybrid_write_suppress_indices
+
+    steps = {
+        "b": HybridReplayStep(
+            "b", 1, 1, 16, 48, True, no_write={0: [(16, 32)], 1: [(40, 48)]}
+        )
+    }
+    # batch: req "a" with 5 tokens, then "b" with the 32-token span [16,48)
+    idx = hybrid_write_suppress_indices(
+        steps, ["a", "b"], np.array([0, 5, 37], dtype=np.int32)
+    )
+    assert idx[0].tolist() == list(range(5, 21))  # tokens of [16,32)
+    assert idx[1].tolist() == list(range(29, 37))  # tokens of [40,48)
