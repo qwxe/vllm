@@ -1298,9 +1298,11 @@ class Scheduler(SchedulerInterface):
                     # follows only after the last span (one span per forward).
                     request.pending_hole_ranges = list(hybrid_lookup.plan.spans)
                     request.hybrid_plan = hybrid_lookup.plan
+                    chunk_budget = min(token_budget, input_budget - draft_slots)
+                    if long_prefill_token_threshold > 0:
+                        chunk_budget = min(chunk_budget, long_prefill_token_threshold)
                     hole_pieces, n_tail = self._plan_hybrid_chunk(
-                        request,
-                        min(token_budget, input_budget - draft_slots),
+                        request, chunk_budget
                     )
                     num_new_tokens = range_tokens(hole_pieces)
                     if num_new_tokens == 0:
@@ -1947,7 +1949,12 @@ class Scheduler(SchedulerInterface):
         """holes/core: pick the hole pieces and tail tokens of a request with
         pending holes for this step (KERNEL-ALGO 5.2)."""
         if request.hybrid_plan is not None:
-            return self._plan_hybrid_chunk(request, token_budget)
+            return self._plan_hybrid_chunk(
+                request,
+                min(token_budget, long_prefill_token_threshold)
+                if long_prefill_token_threshold > 0
+                else token_budget,
+            )
         cfg = self.hole_config
         budget = token_budget
         if cfg.step_budget > 0:
