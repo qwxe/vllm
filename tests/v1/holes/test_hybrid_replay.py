@@ -460,3 +460,158 @@ def test_hybrid_admission_one_slot_short_rejects_without_side_effects():
         assert not mgr.req_to_blocks.get("1")
     # exactly enough: admitted
     assert _admit(m, r1, lk, reserved_blocks=free - need) is not None
+
+
+# ---- scheduler: serialized replay steps, fence, rows, lifecycle (M 4-6) ----
+
+import torch  # noqa: E402
+
+from tests.v1.holes import holes_utils as U  # noqa: E402
+from tests.v1.holes.test_l2_holes import _estep  # noqa: E402
+from vllm.v1.kv_cache_interface import (  # noqa: E402
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+)
+
+BS = 16
+PROMPT = list(range(1, 1 + 6 * BS + 7))  # 6 full pages + 7 tokens = 103
+
+
+def _hyb_runner(holes=None, num_gpu_blocks=200):
+    from tests.v1.kv_connector.unit.offloading_connector.utils import RequestRunner
+
+    groups = [
+        KVCacheGroupSpec(
+            ["l0"],
+            FullAttentionSpec(
+                block_size=BS, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["l1"],
+            SlidingWindowSpec(
+                block_size=BS,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=2 * BS,
+            ),
+        ),
+    ]
+    cfg = {"enabled": True, "test_hooks": True}
+    cfg.update(holes or {})
+    r = RequestRunner(
+        block_size=BS,
+        num_gpu_blocks=num_gpu_blocks,
+        kv_cache_groups=groups,
+        async_scheduling=False,
+        additional_config={"holes": cfg},
+        extra_config_overrides={"eviction_policy": "rate"},
+    )
+    from tests.v1.kv_connector.unit.offloading_connector.utils import (
+        generate_store_output,
+    )
+
+    r.manager.prepare_store.side_effect = lambda keys, ctx: generate_store_output(keys)
+    return r
+
+
+def _prime_runner(r):
+    a = U.make_request("a", PROMPT)
+    r.scheduler.add_request(a)
+    while "a" in r.scheduler.requests:
+        _estep(r)
+    return a
+
+
+def _evict_gpu(r, probe, page, gid):
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+    r.scheduler.kv_cache_manager.block_pool.cached_block_hash_to_block._cache.pop(
+        make_block_hash_with_group_id(probe.block_hashes[page], gid)
+    )
+
+
+def test_scheduler_hybrid_effective_with_the_rate_connector():
+    r = _hyb_runner()
+    assert r.scheduler.hybrid_holes_enabled is True
+
+
+def test_scheduler_replays_the_hole_then_the_tail():
+    r = _hyb_runner()
+    _prime_runner(r)
+    s = r.scheduler
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    s.add_request(b)
+    out = s.schedule()
+    assert out.num_scheduled_tokens["b"] == 16
+    assert out.scheduled_hole_ranges["b"] == [(32, 48)]
+    st = out.hybrid_replay_steps["b"]
+    assert (st.start, st.end, st.restore) == (32, 48, True)
+    # only the SWA group needs an execution row: sources of pages 0,1 + private
+    assert set(st.replacement_rows) == {1}
+    row = st.replacement_rows[1]
+    assert len(row) == 3 and row[0] != 0 and row[1] != 0 and row[2] != 0
+    assert st.no_write == {}
+    # logical frontier stays C=96 during the replay
+    assert s.requests["b"].num_computed_tokens == 96
+    assert s.requests["b"].hybrid_step_pending is True
+    # fence: a second schedule() before the output does not run b again
+    assert "b" not in s.schedule().num_scheduled_tokens
+    # the hole page is not discoverable before the step completed
+    m = s.kv_cache_manager
+    assert m.block_pool.get_cached_block(b.block_hashes[2], [0]) is None
+    mro = U.fake_output(out)
+    mro.sampled_token_ids = [[]]
+    s.update_from_output(out, mro)
+    assert s.requests["b"].hybrid_step_pending is False
+    assert m.block_pool.get_cached_block(b.block_hashes[2], [0]) is not None
+    # next step: the tail (7 tokens) with the SWA row restored to the real one
+    out2 = s.schedule()
+    assert out2.num_scheduled_tokens["b"] == 7
+    assert "b" not in out2.scheduled_hole_ranges
+    st2 = out2.hybrid_replay_steps["b"]
+    assert set(st2.replacement_rows) == {1}
+    real = m.get_block_ids("b")
+    assert st2.replacement_rows[1] == real[1]
+    assert s.requests["b"].hybrid_plan is None
+
+
+def test_scheduler_replay_from_earlier_state_suppresses_retained_writes():
+    r = _hyb_runner()
+    _prime_runner(r)
+    s = r.scheduler
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)  # Full page 2 missing
+    _evict_gpu(r, b, 1, 1)  # SWA windows ending at 32 and 48 broken
+    s.add_request(b)
+    out = s.schedule()
+    st = out.hybrid_replay_steps["b"]
+    assert out.scheduled_hole_ranges["b"] == [(16, 48)]
+    assert (st.start, st.end) == (16, 48)
+    # pages 1 (retained) is replayed but must not be rewritten
+    assert st.no_write == {0: [(16, 32)]}
+    assert len(st.replacement_rows[1]) == 3
+
+
+def test_scheduler_replay_protects_sources_and_frees_everything():
+    r = _hyb_runner()
+    _prime_runner(r)
+    s = r.scheduler
+    m = s.kv_cache_manager
+    free0 = m.block_pool.get_num_free_blocks()
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)
+    s.add_request(b)
+    out = s.schedule()
+    row = out.hybrid_replay_steps["b"].replacement_rows[1]
+    src = m.block_pool.blocks[row[0]]
+    assert src.ref_cnt >= 1  # protected source of the SWA window
+    s.finish_requests("b", __import__("vllm.v1.request", fromlist=["x"]).RequestStatus.FINISHED_ABORTED)
+    s.schedule()
+    assert src.ref_cnt == 0
+    assert m.block_pool.get_num_free_blocks() >= free0 - 1  # hole page cached? no
+    for g in m.coordinator.single_type_managers:
+        assert "b" not in g.req_to_blocks or not g.req_to_blocks["b"]
