@@ -412,3 +412,40 @@ copied, run with `PYTHONPATH`; final = this branch):
   requests (no cached prefix or a different split of it), i.e. bf16 prefill-shape noise and not a holes effect; non-vacuity
   holds: C scheduled 8 hole steps (4240 hole tokens) with 8 admissions that loaded L2 ranges and recomputed a hole, 1515 L2
   evictions. Per the note a near-tie is not a pass; the verdict is left to the reviewer.
+
+## holes-v2 Part B: hybrid (multi-group) replay prerequisite — T20261029-holes-v2-impl2
+
+Scope: note r7 section 9 stage 3 (the M prerequisite) for **Full + sliding-window and Full-only multi-group** layouts on the V1 runner. Stage 4 (L commit 6 / M 7.2, L2 sources) and Mamba execution are NOT done (see "Not done"). Everything is off unless holes are configured; a single-group layout keeps the Part A path.
+
+### What exists (commit prefix `holes-v2 M1`..`M8`)
+
+| piece | where | tests |
+|---|---|---|
+| dependency-closure planner `plan_hybrid_replay` (furthest legal frontier with benefit over the stock hit; spans extend back to the nearest exact state; overlapping spans merge) | `vllm/v1/core/holes.py` | `tests/v1/holes/test_hybrid_replay.py` (M4 section 4 oracle and variants) |
+| supported-group classifier `hybrid_group_kinds` (by manager type; Full required; Mamba only in `align`) | `holes.py` | same file |
+| residency scan `HybridKVCacheCoordinator.hybrid_residency` (per Full spec group holes with `min_reuse` in page units, exact-C state boundaries via the manager finders) | `kv_cache_coordinator.py` | same file |
+| lookup `KVCacheManager.get_computed_blocks_hybrid`, `hybrid_holes_enabled`, group-wise hole counting, all-hit-first admission `allocate_hybrid_computed_blocks` (stock-hit-at-C tables plus fresh hole pages) | `kv_cache_manager.py`, `kv_cache_coordinator.py`, `single_type_kv_cache_manager.py` (`touch=` flag) | tail-switch equality with a stock hit; one slot short rejects without side effects |
+| protected sources + private SWA pages `acquire_hybrid` / `release_hybrid`; execution rows and write-suppression ranges per replay step | `kv_cache_manager.py` | scheduler tests |
+| `HybridReplayStep` carrier on `SchedulerOutput`, `Request` plan fields, `is_hybrid_replay_step` (FULL graph and microbatching off for that step only) | `sched/output.py`, `request.py`, `gpu_model_runner.py` | M4 tests |
+| scheduler: lookup in the waiting loop, one chunk of one span per forward (cut at the common block boundary), per-request fence, completion-driven publication (`cache_hole_blocks` at the output), tail step restores the real rows, release on finish/abort/preempt | `sched/scheduler.py` | M7 tests (fence, publication, chunking, abort) |
+| worker: `BlockTable.replace_row` (checked, clears trailing cells), `apply_hybrid_replay_rows` by request id after condense, `hybrid_write_suppress_indices` -> `PAD_SLOT_ID` after `compute_slot_mapping`, multi-group allowed in the segment view when every request has one segment | `block_table.py`, `hole_segments.py`, `gpu_model_runner.py` | M3, M8 tests |
+| GPU driver `tests/v1/holes/gpu_hybrid_e2e.py` (tiny Full+SWA Llama, `load_format=dummy`, bf16, three scenarios per prompt) | tests | run receipt in the trail |
+
+### Activation (scheduler `_hybrid_holes_effective`)
+
+Effective iff: manager-level support (prefix caching, supported groups, no EAGLE/DCP/PCP) AND V1 runner AND no Mamba group (not wired yet; one warning, stock lookup) AND the CPU offload connector with `eviction_policy="rate"` is present (M note U4: no connector = no hybrid holes; `holes.test_hooks` lifts only this connector requirement, for CPU tests) AND `connector_allows_holes` (Part A table). NIXL, Mooncake and MultiConnector stay off [dep MC].
+
+### Defaults and implementation choices (II.1 "Defaults: vLLM or real deployments")
+
+- Benefit rule: a plan is used only if its executed tokens (repairs + tail) are fewer than the stock hit's; among those the furthest frontier wins (M section 4 steps 5-6). An equal-cost replay-from-0 plan is the stock path.
+- A replayed span starts only at an exact retained state of every state group (or 0); with no state group (Full-only) any block boundary is a start. Chunk cuts inside a span fall on the lcm of the group block sizes (stock chunk alignment).
+- The execution row of an SWA group is: null below the window of the chunk start, retained source blocks (protected by a ref) from the window start up to the span's first page, private pages (allocated once at admission, sized for the largest span, reused by later spans) from the span's first page. The real row is restored in the first tail step.
+- Retained Full cells inside a span are never rewritten (negative slots); groups of one spec share hash entries, so a page missing in one such group is a hole in all (stock joint lookup).
+- Publication of hole pages happens when the step's output arrives (`allocate_slots(defer_hole_caching=True)` skips the schedule-time caching of Part A's single-group path).
+- Resumed requests with output tokens and requests with encoder inputs use the stock path.
+
+### Not done (reported, not hidden)
+
+- Mamba execution (state restore into a private running state, explicit a/b in `mamba_utils`, Mamba attention metadata): the planner/residency/admission already treat Mamba groups, the scheduler gates them off.
+- Stage 4: L2 Full/SWA/Mamba sources (connector hole API is single-group, `kv_group_configs[0]`), one load job over all groups, store cap for hybrid, external stats, MultiConnector.
+- GPU: only the tiny dummy-weight Full+SWA model, eager, greedy bf16; no CUDA-graph run, no real checkpoint, no TP/PP.
