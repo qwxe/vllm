@@ -505,3 +505,34 @@ def test_t13_clear_keeps_sessions_and_drops_nodes():
     pol.clear()
     assert pol.node_layout_for_test() == {}
     assert pol._reader_rate("s", 5.0) != 1e6 and pol.sessions.reqs
+
+
+# ---------------------------------------------------------------- SWA window width (holes-v2 Part B)
+
+
+def _swa_node(window):
+    pol = make_policy(kinds=("full", "swa"))
+    if window is not None:
+        pol.set_group_windows({1: window})
+    ca, cb = ctx("ra", "sa"), ctx("rb", "sb")
+    pol.on_request_arrival(ca)
+    pol.on_request_arrival(cb)
+    kf, _ = put_chain(pol, ca, [1, 2, 3])
+    ks, _ = put_chain(pol, ca, [31], g=1, pos=[48])
+    finish(pol, ca, [kf, ks])
+    adopt(cb, ca, kf[:1])
+    finish(pol, cb, [kf[:1]])
+    set_rates(pol, {"sa": 0.001, "sb": 1.0})
+    return pol, kf
+
+
+def test_swa_window_chunks_change_the_closure_of_a_node():
+    """An SWA state is usable at a boundary only if its whole window of chunks
+    is present: a window of 3 chunks needs keys at 48, 32 and 16, but only the
+    key at 48 is stored, so the state cannot shorten the recompute. The default
+    (no width given) is the single chunk ending at the boundary."""
+    base, kf = _swa_node(None)
+    one, _ = _swa_node(1)
+    three, kf3 = _swa_node(3)
+    assert base.node_action_scores_for_test(kf[2]) == one.node_action_scores_for_test(kf[2])
+    assert three.node_action_scores_for_test(kf3[2]) != base.node_action_scores_for_test(kf[2])
