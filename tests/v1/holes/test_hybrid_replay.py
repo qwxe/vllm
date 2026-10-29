@@ -6,6 +6,8 @@ Expected values are hand-derived from the M section 4 recovery oracle, not
 produced by the planner under test.
 """
 
+import pytest
+
 from vllm.v1.core.holes import plan_hybrid_replay
 
 N = 100  # prompt tokens; the last token is always computed
@@ -877,6 +879,43 @@ def test_scheduler_mamba_group_is_effective_and_replay_carries_a_state_restore()
     assert st2.state_sources == {} and st2.state_dests == {}
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="open question Q-D (code-r3 finding 2): corrected oracle ref_cnt >= 1 pending acceptance",
+)
+def test_scheduler_mamba_restore_source_ref_cnt_original_oracle():
+    r = _hyb_runner(kinds=("full", "mamba"))
+    s = r.scheduler
+    assert s.hybrid_holes_enabled is True
+    s.max_num_scheduled_tokens = 32  # chunk ends cache Mamba states at 32, 64, 96
+    _prime_runner(r)
+    s.max_num_scheduled_tokens = 1000
+    b = U.make_request("b", PROMPT)
+    _evict_gpu(r, b, 2, 0)  # Full page 2 missing; Mamba state at 32 retained
+    s.add_request(b)
+    out = s.schedule()
+    st = out.hybrid_replay_steps["b"]
+    assert (st.start, st.end, st.restore) == (32, 48, True)
+    # Mamba execution row: private running-state block at the span's last page,
+    # null elsewhere; the source is the cached boundary state at 32.
+    row = st.replacement_rows[1]
+    assert len(row) == 3 and row[0] == 0 and row[1] == 0 and row[2] != 0
+    m = s.kv_cache_manager
+    src = m.block_pool.get_cached_block(b.block_hashes[1], [1])[0]
+    assert st.state_sources == {1: [src.block_id]}
+    assert st.state_dests == {1: [row[2]]}
+    assert row[2] != src.block_id
+    # the source is protected while the replay runs and everything is returned
+    assert src.ref_cnt >= 2
+    mro = U.fake_output(out)
+    mro.sampled_token_ids = [[]]
+    s.update_from_output(out, mro)
+    out2 = s.schedule()  # tail: the real rows come back, stock Mamba restore
+    st2 = out2.hybrid_replay_steps["b"]
+    assert st2.replacement_rows[1] == m.get_block_ids("b")[1]
+    assert st2.state_sources == {} and st2.state_dests == {}
+
+
 def test_scheduler_mamba_replay_from_zero_has_no_state_restore():
     r = _hyb_runner(kinds=("full", "mamba"))
     s = r.scheduler
@@ -1052,3 +1091,46 @@ def test_connector_range_list_is_still_group_zero():
     (job,) = c.connector_scheduler._current_batch_load_jobs.values()
     assert list(job.dst_spec.group_sizes) == [1, 0]
 
+
+
+def test_connector_admission_is_keyed_by_group_index_not_position():
+    # code-r3 finding 5: with the offload group configs not in KV-group order,
+    # admission must still touch the groups named by group index (group 0 and
+    # the groups of the range dict), not the configs at those positions.
+    from vllm.v1.kv_offload.base import (
+        OffloadPolicy,
+    )
+
+    r = _hyb_runner(kinds=("full", "full", "full"))
+    r.manager.lookup.side_effect = None
+    b = U.make_request("b", PROMPT)
+    s = r.scheduler
+    s.add_request(b)
+    c = r.scheduler_connector
+    c.get_block_hit_mask(b, [False] * 5)
+    s.kv_cache_manager.allocate_slots(b, b.num_tokens, 0, None)
+    cs = c.connector_scheduler
+    st = cs._req_status["b"]
+    rot = (1, 2, 0)  # positions hold the configs of groups 1, 2, 0
+    cs.config = cs.config._replace(
+        kv_group_configs=tuple(cs.config.kv_group_configs[i] for i in rot)
+    )
+    st.group_states = tuple(st.group_states[i] for i in rot)
+    st.offloading_context = type(
+        "Ctx", (), {"policy": OffloadPolicy.CHUNK_LEVEL}
+    )()
+    for gs in st.group_states:
+        gs.next_stored_chunk_idx = 0
+    b.pending_hole_ranges = [(2 * BS, 3 * BS)]
+    cs.manager.prepare_load = lambda keys, ctx: None
+    try:
+        c.update_state_after_alloc_with_ranges(
+            b, s.kv_cache_manager.get_blocks("b"), {2: [(2 * BS, 3 * BS)]}
+        )
+    except Exception:
+        pass  # the load-job tail is not under test here
+    by_idx = {
+        gc.group_idx: gs.next_stored_chunk_idx
+        for gc, gs in zip(cs.config.kv_group_configs, st.group_states)
+    }
+    assert by_idx == {0: 2, 1: 0, 2: 2}

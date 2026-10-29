@@ -155,7 +155,7 @@ def test_t11_activation_table(connector, extra, allowed):
     assert (reason is None) == allowed
 
 
-def _hybrid_gate(connector, extra):
+def _hybrid_gate(connector, extra, spec=None, tp=1, pp=1):
     """Run Scheduler._hybrid_holes_effective on a stub scheduler (M 7, Q5 (a))."""
     from types import SimpleNamespace as NS
 
@@ -174,7 +174,11 @@ def _hybrid_gate(connector, extra):
         _connector_async_mask=isinstance(connector, OffloadingConnector),
         hole_config=NS(test_hooks=False),
     )
-    cfg = NS(kv_transfer_config=NS(kv_connector_extra_config=extra))
+    cfg = NS(
+        kv_transfer_config=NS(kv_connector_extra_config=extra),
+        speculative_config=spec,
+        parallel_config=NS(tensor_parallel_size=tp, pipeline_parallel_size=pp),
+    )
     return Scheduler._hybrid_holes_effective(stub, cfg)
 
 
@@ -184,6 +188,24 @@ def test_hybrid_gate_admits_only_the_offloading_connector_rate_path():
     assert _hybrid_gate(_MaskOnly(), {"eviction_policy": "rate"}) is False
     assert _hybrid_gate(_NoMask(), {"eviction_policy": "rate"}) is False
     assert _hybrid_gate(_L2Fake(), {"eviction_policy": "lru"}) is False
+
+
+@pytest.mark.parametrize(
+    "spec,tp,pp,word",
+    [
+        (object(), 1, 1, "speculative"),  # ngram etc., not only EAGLE (M 7)
+        (None, 2, 1, "parallelism"),
+        (None, 1, 2, "parallelism"),
+    ],
+)
+def test_hybrid_gate_inert_with_spec_decode_or_tp_pp(caplog, spec, tp, pp, word):
+    # code-r3 finding 4: M 7 lists drafting and TP/PP as outside hybrid holes
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        assert _hybrid_gate(None, None, spec=spec, tp=tp, pp=pp) is False
+    msgs = [r.getMessage() for r in caplog.records if "Hybrid holes disabled" in r.getMessage()]
+    assert len(msgs) == 1 and word in msgs[0].lower()
 
 
 def test_hybrid_plus_l2_rate_path_stays_inert_until_stage_4(caplog):
