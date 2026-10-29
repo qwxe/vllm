@@ -128,6 +128,20 @@ class BlockTable:
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
 
+    def replace_row(self, block_ids: list[int], row_idx: int) -> None:
+        """holes/M: replace the whole row (not append). Obsolete trailing
+        cells of a shorter row are cleared; an overlong row is rejected."""
+        if len(block_ids) > self.max_num_blocks_per_req:
+            raise ValueError(
+                f"replacement row has {len(block_ids)} blocks, table width "
+                f"is {self.max_num_blocks_per_req}"
+            )
+        old = int(self.num_blocks_per_row[row_idx])
+        self.add_row(block_ids, row_idx)
+        new = len(block_ids)
+        if old > new:
+            self.block_table.np[row_idx, new:old] = 0
+
     def clear_row(self, row_idx: int) -> None:
         num_blocks = self.num_blocks_per_row[row_idx]
         if num_blocks > 0:
@@ -267,6 +281,20 @@ class MultiGroupBlockTable:
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.add_row(block_ids[i], row_idx)
+
+    def replace_row(
+        self, block_ids: tuple[list[int] | None, ...], row_idx: int
+    ) -> None:
+        """holes/M: replace the full row of every group whose entry is not
+        None; groups with None keep their row. All lengths are checked before
+        any group is written."""
+        for i, block_table in enumerate(self.block_tables):
+            ids = block_ids[i]
+            if ids is not None and len(ids) > block_table.max_num_blocks_per_req:
+                raise ValueError(f"replacement row of group {i} is too long")
+        for i, block_table in enumerate(self.block_tables):
+            if block_ids[i] is not None:
+                block_table.replace_row(block_ids[i], row_idx)
 
     def clear_row(self, row_idx: int) -> None:
         for block_table in self.block_tables:
