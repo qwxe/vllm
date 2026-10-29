@@ -1706,11 +1706,10 @@ class OffloadingConnectorScheduler:
 
             if req.status is RequestStatus.FINISHED_ABORTED:
                 num_tokens_after_batch = req.num_computed_tokens
-                if req.pending_hole_ranges:
+                holes = req.pending_hole_ranges
+                if isinstance(holes, list) and holes:
                     # holes: blocks of an uncomputed hole are never offered.
-                    num_tokens_after_batch = min(
-                        num_tokens_after_batch, req.pending_hole_ranges[0][0]
-                    )
+                    num_tokens_after_batch = min(num_tokens_after_batch, holes[0][0])
             elif req.is_finished():
                 # Clamp to the GPU prefix cache's commit point. The final sampled
                 # token's slot is never committed (under spec decode it holds a
@@ -1719,13 +1718,15 @@ class OffloadingConnectorScheduler:
             else:
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
-                if req.pending_hole_ranges:
+                holes = req.pending_hole_ranges
+                if isinstance(holes, list) and holes:
                     # holes: offer only the contiguous computed range, i.e.
                     # up to the first hole this step does not complete, else
                     # the frontier plus this step's tail. Hole pieces lie
                     # below the frontier and do not advance it.
-                    pieces = scheduler_output.scheduled_hole_ranges.get(req_id, [])
-                    remaining = subtract_ranges(req.pending_hole_ranges, pieces)
+                    scheduled = getattr(scheduler_output, "scheduled_hole_ranges", None)
+                    pieces = (scheduled or {}).get(req_id, [])
+                    remaining = subtract_ranges(holes, pieces)
                     n_tail = num_scheduled_tokens - range_tokens(pieces)
                     num_tokens_after_batch = min(
                         num_tokens_after_batch,
