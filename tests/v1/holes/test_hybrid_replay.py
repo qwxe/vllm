@@ -43,10 +43,11 @@ def test_nearest_earlier_state_is_used():
 
 def test_overlapping_repairs_merge_once():
     # both ranges extend back to 0 and overlap -> one span
-    p = plan_hybrid_replay(N, [[(16, 32), (48, 64)]], [{64}], [0, 64])
+    p = plan_hybrid_replay(N, [[(16, 24), (36, 48)]], [{64}], [0, 64])
     assert p is not None
-    assert p.spans == ((0, 64),)
-    assert p.tail_restore is False  # replay ends exactly at the frontier
+    assert p.spans == ((0, 48),)
+    assert p.tail_restore is True
+    assert p.executed_tokens(N) == 48 + 36
 
 
 def test_serialized_jump_with_restore():
@@ -54,7 +55,8 @@ def test_serialized_jump_with_restore():
     assert p is not None and p.frontier == 64
     assert p.spans == ((0, 32), (48, 64))
     assert p.span_restore == (False, True)
-    assert p.tail_restore is False
+    assert p.tail_restore is False  # replay ends exactly at the frontier
+    assert p.executed_tokens(N) == 32 + 16 + 36
 
 
 def test_union_of_full_groups():

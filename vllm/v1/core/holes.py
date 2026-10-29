@@ -235,3 +235,111 @@ def plan_step(
     if pieces and 0 < n_tail < cfg.min_mixed_tail:
         n_tail = 0
     return pieces, n_tail
+
+
+# ---- hybrid (Full + Mamba/SWA) replay planner (M note section 4) ---------
+
+
+@dataclass(frozen=True)
+class HybridReplayPlan:
+    """Request-local plan of a hybrid request with a reuse frontier.
+
+    ``spans`` are the ordered repair intervals executed with the whole model
+    before the tail; ``span_restore[i]`` says the state of every state group
+    is restored from a retained source at ``spans[i][0]`` (False when the span
+    starts at 0 with the model's initial state, or continues the previous
+    span). The tail starts at ``frontier``; ``tail_restore`` is False when the
+    last span ends exactly there (the running state simply continues).
+    """
+
+    frontier: int
+    spans: tuple[Range, ...]
+    span_restore: tuple[bool, ...]
+    tail_restore: bool
+
+    def executed_tokens(self, num_tokens: int) -> int:
+        return range_tokens(list(self.spans)) + num_tokens - self.frontier
+
+
+def _close_spans(
+    full_missing: list[Range], state_ok: Any, frontier: int
+) -> list[Range]:
+    """Dependency closure of the Full write obligations below ``frontier``:
+    a span can only start where every state group has an exact retained
+    state (or at 0); otherwise it extends back to the nearest such boundary.
+    Overlapping and adjacent spans merge (the running state continues)."""
+    need = sorted(
+        (s, min(e, frontier))
+        for rs in full_missing
+        for s, e in rs
+        if s < frontier
+    )
+    spans: list[Range] = []
+    for s, e in need:
+        start = s
+        while start > 0 and not state_ok(start):
+            start -= 1
+        if spans and start <= spans[-1][1]:
+            ps, pe = spans[-1]
+            spans[-1] = (ps, max(pe, e))
+        else:
+            spans.append((start, e))
+    # extending a start back can overlap an earlier span: merge until stable
+    merged: list[Range] = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            ps, pe = merged[-1]
+            merged[-1] = (ps, max(pe, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def plan_hybrid_replay(
+    num_tokens: int,
+    full_missing: list[list[Range]],
+    state_groups: list[set[int]],
+    frontiers: list[int],
+) -> HybridReplayPlan | None:
+    """Choose the furthest legal reuse frontier whose whole-model repair plan
+    executes fewer tokens than the stock prefix hit (M section 4, steps 3-6).
+
+    ``full_missing``: per Full group, the token ranges whose KV is not
+    retained (GPU or L2). ``state_groups``: per Mamba/SWA group, the set of
+    boundaries at which that group has an exact retained state. ``frontiers``:
+    candidate reuse boundaries (0 is always usable). A frontier is legal if
+    every state group has its state exactly there and it leaves the final
+    token to compute. Returns None when the stock prefix path is at least as
+    good.
+    """
+
+    def state_ok(c: int) -> bool:
+        return c == 0 or all(c in g for g in state_groups)
+
+    cands = sorted(
+        {c for c in frontiers if 0 <= c < num_tokens and state_ok(c)} | {0}
+    )
+    missing_starts = [s for rs in full_missing for s, _ in rs]
+    first_hole = min(missing_starts, default=None)
+    # stock hit: furthest legal frontier with no Full hole below it
+    stock_c = max(
+        (c for c in cands if first_hole is None or c <= first_hole), default=0
+    )
+    stock_cost = num_tokens - stock_c
+    best: HybridReplayPlan | None = None
+    for c in reversed(cands):  # furthest first
+        if c <= stock_c:
+            break
+        spans = _close_spans(full_missing, state_ok, c)
+        restore = tuple(s > 0 and not (i > 0 and s == spans[i - 1][1])
+                        for i, (s, _) in enumerate(spans))
+        plan = HybridReplayPlan(
+            frontier=c,
+            spans=tuple(spans),
+            span_restore=restore,
+            tail_restore=not (spans and spans[-1][1] == c),
+        )
+        if plan.executed_tokens(num_tokens) < stock_cost:
+            best = plan
+            break
+    return best
