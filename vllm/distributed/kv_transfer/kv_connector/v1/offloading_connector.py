@@ -198,16 +198,18 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsBlockHitMask)
         return max(0, bound - num_computed_tokens)
 
     def get_block_hit_mask(
-        self, request: "Request", local_hit: list[bool]
+        self, request: "Request", local_hit: list[bool], group_idx: int = 0
     ) -> tuple[list[bool] | None, bool]:
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.get_block_hit_mask(request, local_hit)
+        return self.connector_scheduler.get_block_hit_mask(
+            request, local_hit, group_idx
+        )
 
     def update_state_after_alloc_with_ranges(
         self,
         request: "Request",
         blocks: "KVCacheBlocks",
-        load_ranges: list[tuple[int, int]],
+        load_ranges: "list[tuple[int, int]] | dict[int, list[tuple[int, int]]]",
     ) -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_state_after_alloc_with_ranges(

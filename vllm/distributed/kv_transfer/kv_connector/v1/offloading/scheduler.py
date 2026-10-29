@@ -1130,7 +1130,7 @@ class OffloadingConnectorScheduler:
         return num_hit_tokens, bool(num_hit_tokens)
 
     def get_block_hit_mask(
-        self, request: Request, local_hit: list[bool]
+        self, request: Request, local_hit: list[bool], group_idx: int = 0
     ) -> tuple[list[bool] | None, bool]:
         """holes: per-block mask of the blocks the CPU tier can load.
 
@@ -1138,6 +1138,9 @@ class OffloadingConnectorScheduler:
         with holes) is ready in the manager and misses locally. The scan goes
         on past misses. A pending or retried lookup defers the whole answer.
         Loads of this connector are asynchronous (the second value).
+        ``group_idx`` selects the KV cache group whose keys are asked (hybrid
+        holes ask each Full group; the locally computed frontier of the
+        request is only recorded for group 0, the single-group path).
         """
         req_status = self._req_status[request.request_id]
         for group_state in req_status.group_states:
@@ -1145,15 +1148,16 @@ class OffloadingConnectorScheduler:
         if req_status.transfer_jobs:
             return None, False
         req_status.update_offload_keys()
-        group_config = self.config.kv_group_configs[0]
+        group_config = self.config.kv_group_configs[group_idx]
         bs = group_config.tokens_per_block
         lead = 0
         while lead < len(local_hit) and local_hit[lead]:
             lead += 1
-        req_status.num_locally_computed_tokens = lead * bs
+        if group_idx == 0:
+            req_status.num_locally_computed_tokens = lead * bs
         if request.skip_reading_prefix_cache:
             return [], False
-        keys = req_status.group_states[0].offload_keys
+        keys = req_status.group_states[group_idx].offload_keys
         n = min((request.num_tokens - 1) // bs, len(keys))
         mask = [False] * n
         defer = False
@@ -1165,7 +1169,8 @@ class OffloadingConnectorScheduler:
                 mask[i] = True
             elif result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
                 defer = True
-        req_status.update_num_hit_chunks(lead * bs)
+        if group_idx == 0:
+            req_status.update_num_hit_chunks(lead * bs)
         if defer:
             return None, False
         return mask, any(mask)
@@ -1174,42 +1179,63 @@ class OffloadingConnectorScheduler:
         self,
         request: Request,
         blocks: KVCacheBlocks,
-        load_ranges: list[tuple[int, int]],
+        load_ranges: list[tuple[int, int]] | dict[int, list[tuple[int, int]]],
     ) -> None:
         """holes: one load job for the block ranges the scheduler decided to
-        load (all of one group, listed in position order). No-op for no ranges
-        (a resumed request calls it with none)."""
+        load. A list is the ranges of group 0 (listed in position order); a
+        dict maps a KV group to its ranges: one job over all groups, with
+        the per-group sizes and first block index of the stock
+        ``update_state_after_alloc``. No-op for no ranges (a resumed request
+        calls it with none)."""
         req_status = self._req_status[request.request_id]
-        group_config = self.config.kv_group_configs[0]
-        group_state = req_status.group_states[0]
-        bs = group_config.tokens_per_block
-        group_blocks = blocks.blocks[group_config.group_idx]
+        by_group: dict[int, list[tuple[int, int]]] = (
+            {0: load_ranges} if isinstance(load_ranges, list) else dict(load_ranges)
+        )
         if request.num_computed_tokens == 0:
             # Admission: chunks below the first uncomputed hole are hits or
             # loads; the holes and what lies behind them are offered once
             # their blocks are computed (see _build_store_jobs).
-            self._current_batch_allocated_block_ids.update(
-                block.block_id for block in group_blocks if block.block_id != 0
-            )
-            holes = request.pending_hole_ranges
-            if holes and req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL:
-                group_state.next_stored_chunk_idx = holes[0][0] // bs
-        if not load_ranges:
+            for gid in sorted({0, *by_group}):
+                group_config = self.config.kv_group_configs[gid]
+                group_state = req_status.group_states[gid]
+                bs = group_config.tokens_per_block
+                self._current_batch_allocated_block_ids.update(
+                    block.block_id
+                    for block in blocks.blocks[group_config.group_idx]
+                    if block.block_id != 0
+                )
+                holes = request.pending_hole_ranges
+                if (
+                    holes
+                    and req_status.offloading_context.policy
+                    == OffloadPolicy.CHUNK_LEVEL
+                ):
+                    group_state.next_stored_chunk_idx = holes[0][0] // bs
+        if not any(by_group.values()):
             return
         keys_to_load: list[OffloadKey] = []
         dst_block_ids: list[int] = []
+        group_sizes: list[int] = []
+        block_indices: list[int] = []
         req_status.load_key_ranges.clear()
-        for start, end in load_ranges:
-            for idx in range(start // bs, end // bs):
-                key = group_state.offload_keys[idx]
-                keys_to_load.append(key)
-                dst_block_ids.append(group_blocks[idx].block_id)
-                req_status.load_key_ranges.append((idx * bs, (idx + 1) * bs, key))
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            ranges = by_group.get(group_config.group_idx, [])
+            bs = group_config.tokens_per_block
+            group_blocks = blocks.blocks[group_config.group_idx]
+            n_before = len(dst_block_ids)
+            for start, end in ranges:
+                for idx in range(start // bs, end // bs):
+                    key = group_state.offload_keys[idx]
+                    keys_to_load.append(key)
+                    dst_block_ids.append(group_blocks[idx].block_id)
+                    req_status.load_key_ranges.append((idx * bs, (idx + 1) * bs, key))
+            group_sizes.append(len(dst_block_ids) - n_before)
+            block_indices.append(ranges[0][0] // bs if ranges else 0)
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
-            dst_block_ids,
-            group_sizes=[len(dst_block_ids)],
-            block_indices=[load_ranges[0][0] // bs],
+            dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(

@@ -967,3 +967,88 @@ def test_scheduler_full_swa_mamba_all_three_groups_replay():
     assert set(st.replacement_rows) == {1, 2}
     assert set(st.state_sources) == {2}  # only Mamba has a state copy
     assert len(st.replacement_rows[1]) == 3 and st.replacement_rows[2][-1] != 0
+
+
+# ---- stage 4 building block: the connector hole API for any KV group --------
+
+
+def _two_full_l2():
+    from vllm.v1.kv_offload.base import LookupResult
+
+    r = _hyb_runner(kinds=("full", "full"))
+    r.l2 = set()
+    r.manager.lookup.side_effect = lambda k, ctx: (
+        LookupResult.HIT if k in r.l2 else LookupResult.MISS
+    )
+    return r
+
+
+def _gkey(req, i, gid):
+    from vllm.v1.kv_offload.base import make_offload_key
+
+    return make_offload_key(req.block_hashes[i], gid)
+
+
+def test_connector_mask_is_answered_per_group():
+    r = _two_full_l2()
+    a = U.make_request("a", PROMPT)
+    r.l2 = {_gkey(a, 1, 0), _gkey(a, 2, 1), _gkey(a, 3, 1)}
+    b = U.make_request("b", PROMPT)
+    r.scheduler.add_request(b)  # registers the connector state of b
+    c = r.scheduler_connector
+    n = (b.num_tokens - 1) // BS
+    local = [False] * n
+    m0, _ = c.get_block_hit_mask(b, local)
+    m1, _ = c.get_block_hit_mask(b, local, group_idx=1)
+    assert m0[:4] == [False, True, False, False]
+    assert m1[:4] == [False, False, True, True]
+
+
+def test_connector_one_load_job_over_the_ranges_of_several_groups():
+    from tests.v1.kv_connector.unit.offloading_connector.utils import (
+        MockLoadStoreSpec,
+    )
+
+    r = _two_full_l2()
+    a = U.make_request("a", PROMPT)
+    r.l2 = {_gkey(a, 1, 0), _gkey(a, 2, 1), _gkey(a, 3, 1)}
+    b = U.make_request("b", PROMPT)
+    s = r.scheduler
+    s.add_request(b)
+    c = r.scheduler_connector
+    c.get_block_hit_mask(b, [False] * 5)  # group states get their keys
+    s.kv_cache_manager.allocate_slots(b, b.num_tokens, 0, None)
+    blocks = s.kv_cache_manager.get_blocks("b")
+    c.update_state_after_alloc_with_ranges(
+        b, blocks, {0: [(BS, 2 * BS)], 1: [(2 * BS, 4 * BS)]}
+    )
+    (job,) = c.connector_scheduler._current_batch_load_jobs.values()
+    assert job.src_spec.offload_keys == [
+        _gkey(b, 1, 0), _gkey(b, 2, 1), _gkey(b, 3, 1)
+    ]
+    assert list(job.dst_spec.group_sizes) == [1, 2]
+    assert list(job.dst_spec.block_indices) == [1, 2]
+    assert list(job.dst_spec.block_ids) == [
+        blocks.blocks[0][1].block_id,
+        blocks.blocks[1][2].block_id,
+        blocks.blocks[1][3].block_id,
+    ]
+    assert isinstance(job.src_spec, MockLoadStoreSpec)
+
+
+def test_connector_range_list_is_still_group_zero():
+    r = _two_full_l2()
+    a = U.make_request("a", PROMPT)
+    r.l2 = {_gkey(a, 1, 0)}
+    b = U.make_request("b", PROMPT)
+    s = r.scheduler
+    s.add_request(b)
+    c = r.scheduler_connector
+    c.get_block_hit_mask(b, [False] * 5)
+    s.kv_cache_manager.allocate_slots(b, b.num_tokens, 0, None)
+    c.update_state_after_alloc_with_ranges(
+        b, s.kv_cache_manager.get_blocks("b"), [(BS, 2 * BS)]
+    )
+    (job,) = c.connector_scheduler._current_batch_load_jobs.values()
+    assert list(job.dst_spec.group_sizes) == [1, 0]
+
