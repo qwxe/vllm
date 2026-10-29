@@ -32,3 +32,58 @@ def test_min_reuse_reaches_manager(holes, expected):
     right after the manager is built."""
     r = _runner(holes)
     r.manager.set_group_kinds.assert_called_once_with(["full"], expected)
+
+
+# ------------------------------------------------------------------ L commit 2: session and prefill-done signalling
+
+from tests.v1.kv_connector.unit.offloading_connector.utils import (  # noqa: E402
+    generate_store_output,
+)
+from vllm import SamplingParams  # noqa: E402
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E402
+    _create_req_context,
+)
+
+from . import holes_utils as U  # noqa: E402
+
+
+def _step(runner, token=7, sample=True):
+    out = runner.scheduler.schedule()
+    mro = U.fake_output(out, token)
+    if not sample:
+        mro.sampled_token_ids = [[] for _ in mro.req_ids]
+    runner.scheduler.update_from_output(out, mro)
+    return out
+
+
+def _runner_with_request(prompt_len=40, holes=None, **kw):
+    r = _runner(holes, async_scheduling=False, **kw)
+    r.manager.prepare_store.side_effect = lambda keys, ctx: generate_store_output(keys)
+    r.scheduler.add_request(U.make_request("q", list(range(1, 1 + prompt_len))))
+    return r
+
+
+def test_req_context_carries_the_session_id():
+    sp = SamplingParams(max_tokens=2, extra_args={"session_id": "sess-1"})
+    req = U.make_request("a", [1, 2, 3])
+    req.sampling_params = sp
+    assert _create_req_context(req).session_id == "sess-1"
+    assert _create_req_context(U.make_request("b", [1, 2, 3])).session_id is None
+
+
+def test_t10_prefill_done_fires_once_with_the_first_sampled_token():
+    r = _runner_with_request(prompt_len=40)
+    _step(r, sample=False)  # a prefill chunk with no sampled token
+    assert r.manager.on_prefill_done.call_count == 0
+    _step(r)
+    assert r.manager.on_prefill_done.call_count == 1
+    assert r.manager.on_prefill_done.call_args.args[0].req_id == "q"
+    _step(r)  # decoding: not signalled again
+    assert r.manager.on_prefill_done.call_count == 1
+
+
+def test_t10_no_signal_for_a_request_that_samples_nothing_yet():
+    r = _runner_with_request(prompt_len=40)
+    for _ in range(2):
+        _step(r, sample=False)
+    assert r.manager.on_prefill_done.call_count == 0
