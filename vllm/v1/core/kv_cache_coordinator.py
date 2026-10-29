@@ -1018,11 +1018,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         block_hashes: list[BlockHash],
         num_tokens: int,
         min_reuse_blocks: int = 1,
+        ext_hit: dict[int, list[bool]] | None = None,
     ) -> HybridResidency:
         """holes/M: scan every group independently, without allocation or
         stats side effects (M section 4 steps 2-3). Groups are recognised by
         their manager type, never by group id. The last token is never
-        reusable, so everything is capped at ``num_tokens - 1``."""
+        reusable, so everything is capped at ``num_tokens - 1``. ``ext_hit``
+        (stage 4, M 7.2): per Full group id, a per-page mask of the pages a
+        lower tier (L2) can load; such a page counts as retained when every
+        group of its joint attention group has it on the GPU or in L2."""
         from math import lcm
 
         limit = num_tokens - 1
@@ -1038,10 +1042,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     block_hashes, self.hash_block_size, bs
                 )
                 n = limit // bs
-                hit = [
-                    bool(mgr.block_pool.get_cached_block(h, group_ids))
-                    for h in itertools.islice(hashes, n)
-                ]
+                if ext_hit:
+                    hit = [
+                        self._page_covered(mgr, h, group_ids, i, ext_hit)
+                        for i, h in enumerate(itertools.islice(hashes, n))
+                    ]
+                else:
+                    hit = [
+                        bool(mgr.block_pool.get_cached_block(h, group_ids))
+                        for h in itertools.islice(hashes, n)
+                    ]
                 hit = apply_min_reuse(hit, min_reuse_blocks)
                 hit += [False] * (n - len(hit))
                 full_missing.append(hits_to_holes(hit, bs))
@@ -1064,8 +1074,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 state_groups.append(ok)
         return HybridResidency(full_missing, state_groups, frontiers)
 
+    @staticmethod
+    def _page_covered(mgr, h, group_ids, i, ext_hit) -> bool:
+        for gid in group_ids:
+            if mgr.block_pool.get_cached_block(h, [gid]):
+                continue
+            e = ext_hit.get(gid)
+            if e is None or i >= len(e) or not e[i]:
+                return False
+        return True
+
     def hybrid_blocks_at(
-        self, block_hashes: list[BlockHash], frontier: int
+        self,
+        block_hashes: list[BlockHash],
+        frontier: int,
+        ext_hit: dict[int, list[bool]] | None = None,
+        loads: dict[int, list[int]] | None = None,
     ) -> tuple[list[KVCacheBlock], ...]:
         """holes/M: per-group computed blocks of a hybrid hit at ``frontier``:
         what a stock prefix hit at the frontier would give, except that Full
@@ -1079,7 +1103,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 hashes = resolve_block_hashes(
                     block_hashes, self.hash_block_size, bs
                 )
-                for h in itertools.islice(hashes, frontier // bs):
+                for i, h in enumerate(itertools.islice(hashes, frontier // bs)):
+                    if ext_hit:
+                        # stage 4: a page held by the GPU or L2 in every group
+                        # is covered; the L2-only groups' pages are loads into
+                        # fresh blocks (null here, like a hole).
+                        covered = self._page_covered(mgr, h, group_ids, i, ext_hit)
+                        for gid in group_ids:
+                            one = (
+                                mgr.block_pool.get_cached_block(h, [gid])
+                                if covered
+                                else None
+                            )
+                            out[gid].append(one[0] if one else mgr._null_block)
+                            if covered and not one and loads is not None:
+                                loads.setdefault(gid, []).append(i)
+                        continue
                     hit = mgr.block_pool.get_cached_block(h, group_ids)
                     for k, gid in enumerate(group_ids):
                         out[gid].append(hit[k] if hit else mgr._null_block)

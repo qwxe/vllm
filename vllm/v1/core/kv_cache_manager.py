@@ -486,9 +486,20 @@ class KVCacheManager:
             for gid, n in private.items()
         }
         coord = self.coordinator
+        def loaded_pages(gid: int) -> set[int]:
+            bs = coord.single_type_managers[gid].block_size
+            return {
+                p
+                for s, e in lookup.load_ranges.get(gid, ())
+                for p in range(s // bs, e // bs)
+            }
+
         holes = {
             gid: hits_to_holes(
-                [not b.is_null for b in lookup.blocks.blocks[gid]],
+                [
+                    (not b.is_null) or p in loaded_pages(gid)
+                    for p, b in enumerate(lookup.blocks.blocks[gid])
+                ],
                 coord.single_type_managers[gid].block_size,
             )
             for gid in coord.hole_group_ids  # type: ignore[attr-defined]
@@ -593,7 +604,9 @@ class KVCacheManager:
             },
         )
 
-    def get_computed_blocks_hybrid(self, request: Request) -> "HybridLookup | None":
+    def get_computed_blocks_hybrid(
+        self, request: Request, ext_hit: dict[int, list[bool]] | None = None
+    ) -> "HybridLookup | None":
         """holes/M: hybrid lookup. Returns None when the stock prefix path is
         at least as good (or holes cannot apply to this request); otherwise
         the plan and the per-group computed blocks at its frontier, with null
@@ -606,15 +619,27 @@ class KVCacheManager:
             request.block_hashes,
             request.num_tokens,
             self.hole_config.min_reuse_blocks,
+            ext_hit,
         )
         plan = plan_hybrid_replay(
             request.num_tokens, res.full_missing, res.state_groups, res.frontiers
         )
         if plan is None:
             return None
+        loads: dict[int, list[int]] = {}
         blocks = coord.hybrid_blocks_at(  # type: ignore[attr-defined]
-            request.block_hashes, plan.frontier
+            request.block_hashes, plan.frontier, ext_hit, loads
         )
+        load_ranges: dict[int, list[Range]] = {}
+        for gid, pages in loads.items():
+            bs = coord.single_type_managers[gid].block_size
+            rs: list[Range] = []
+            for p in pages:
+                if rs and rs[-1][1] == p * bs:
+                    rs[-1] = (rs[-1][0], (p + 1) * bs)
+                else:
+                    rs.append((p * bs, (p + 1) * bs))
+            load_ranges[gid] = rs
         # Useful local hits: the frontier minus every executed token below it
         # (whole-model replay counts as work even where Full K/V is resident).
         executed = range_tokens(
@@ -623,14 +648,15 @@ class KVCacheManager:
         hole_pages = sum(
             1
             for gid in coord.hole_group_ids  # type: ignore[attr-defined]
-            for b in blocks[gid]
-            if b.is_null
+            for p, b in enumerate(blocks[gid])
+            if b.is_null and p not in set(loads.get(gid, ()))
         )
         return HybridLookup(
             plan=plan,
             blocks=KVCacheBlocks(blocks),
             num_local_cached_tokens=plan.frontier - executed,
             num_hole_pages=hole_pages,
+            load_ranges=load_ranges,
         )
 
     def get_computed_blocks_with_holes(

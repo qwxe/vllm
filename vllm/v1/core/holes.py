@@ -20,7 +20,7 @@ Everything here is off by default. Enable with
 
 import json
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 from vllm.logger import init_logger
@@ -285,6 +285,9 @@ class HybridLookup:
     blocks: Any  # KVCacheBlocks at the plan frontier, null at Full hole pages
     num_local_cached_tokens: int
     num_hole_pages: int
+    # gid -> token ranges of Full pages to load from L2 (stage 4); null blocks
+    # in ``blocks`` that are loads, not holes
+    load_ranges: dict[int, list[Range]] = field(default_factory=dict)
 
 
 def _close_spans(
