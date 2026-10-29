@@ -95,11 +95,6 @@ def test_completed_replay_prefix_of_a_plan():
     assert hybrid_completed_prefix(plan, [(64, 96)]) == 32  # span 0 still open
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="open question Q-C (code-r3 finding 1): may the store offer a "
-    "scheduled-but-uncompleted replay piece? escalated 2026-10-30",
-)
 def test_abort_mid_replay_offers_nothing_beyond_the_unfinished_span():
     from tests.v1.holes import test_hybrid_replay as T
     from vllm.v1.request import RequestStatus

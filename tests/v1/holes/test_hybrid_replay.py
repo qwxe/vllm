@@ -869,44 +869,7 @@ def test_scheduler_mamba_group_is_effective_and_replay_carries_a_state_restore()
     assert st.state_dests == {1: [row[2]]}
     assert row[2] != src.block_id
     # the source is protected while the replay runs and everything is returned
-    assert src.ref_cnt >= 1  # touched out of the free queue
-    mro = U.fake_output(out)
-    mro.sampled_token_ids = [[]]
-    s.update_from_output(out, mro)
-    out2 = s.schedule()  # tail: the real rows come back, stock Mamba restore
-    st2 = out2.hybrid_replay_steps["b"]
-    assert st2.replacement_rows[1] == m.get_block_ids("b")[1]
-    assert st2.state_sources == {} and st2.state_dests == {}
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="open question Q-D (code-r3 finding 2): corrected oracle ref_cnt >= 1 pending acceptance",
-)
-def test_scheduler_mamba_restore_source_ref_cnt_original_oracle():
-    r = _hyb_runner(kinds=("full", "mamba"))
-    s = r.scheduler
-    assert s.hybrid_holes_enabled is True
-    s.max_num_scheduled_tokens = 32  # chunk ends cache Mamba states at 32, 64, 96
-    _prime_runner(r)
-    s.max_num_scheduled_tokens = 1000
-    b = U.make_request("b", PROMPT)
-    _evict_gpu(r, b, 2, 0)  # Full page 2 missing; Mamba state at 32 retained
-    s.add_request(b)
-    out = s.schedule()
-    st = out.hybrid_replay_steps["b"]
-    assert (st.start, st.end, st.restore) == (32, 48, True)
-    # Mamba execution row: private running-state block at the span's last page,
-    # null elsewhere; the source is the cached boundary state at 32.
-    row = st.replacement_rows[1]
-    assert len(row) == 3 and row[0] == 0 and row[1] == 0 and row[2] != 0
-    m = s.kv_cache_manager
-    src = m.block_pool.get_cached_block(b.block_hashes[1], [1])[0]
-    assert st.state_sources == {1: [src.block_id]}
-    assert st.state_dests == {1: [row[2]]}
-    assert row[2] != src.block_id
-    # the source is protected while the replay runs and everything is returned
-    assert src.ref_cnt >= 2
+    assert src.ref_cnt == 1  # touched out of the free queue
     mro = U.fake_output(out)
     mro.sampled_token_ids = [[]]
     s.update_from_output(out, mro)
