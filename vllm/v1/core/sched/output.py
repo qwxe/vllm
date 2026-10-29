@@ -229,6 +229,30 @@ class KVConnectorBlockState:
 
 
 @dataclass
+class HybridReplayStep:
+    """holes/M: one serialized replay step of a hybrid request (M section 4).
+
+    ``[start, end)`` is the actual executed span (num_computed_tokens of the
+    request keeps the logical frontier). ``restore`` says the state of every
+    state group is restored at ``start`` from ``state_sources`` into
+    ``state_dests`` (gid -> block ids) before the forward.
+    ``replacement_rows`` carries the complete new block-table row of every
+    changed group (gid -> block ids); unchanged groups are absent. ``plan_id``
+    and ``step_id`` identify the step so that a stale output is rejected.
+    """
+
+    req_id: str
+    plan_id: int
+    step_id: int
+    start: int
+    end: int
+    restore: bool
+    replacement_rows: dict[int, list[int]] = field(default_factory=dict)
+    state_sources: dict[int, list[int]] = field(default_factory=dict)
+    state_dests: dict[int, list[int]] = field(default_factory=dict)
+
+
+@dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
@@ -322,6 +346,9 @@ class SchedulerOutput:
     scheduled_hole_ranges: dict[str, list[tuple[int, int]]] = field(
         default_factory=dict
     )
+
+    # holes/M: req_id -> serialized hybrid replay step (default absent).
+    hybrid_replay_steps: dict[str, HybridReplayStep] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

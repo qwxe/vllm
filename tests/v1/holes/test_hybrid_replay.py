@@ -211,8 +211,12 @@ def test_hybrid_replay_step_carrier_defaults_empty():
 def test_request_has_no_plan_by_default():
     from vllm.v1.request import Request
 
+    from vllm import SamplingParams
+
     r = Request(
-        request_id="x", prompt_token_ids=[1, 2, 3], sampling_params=None,
+        request_id="x",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=1),
         pooling_params=None,
     )
     assert r.hybrid_plan is None and r.hybrid_step_pending is False

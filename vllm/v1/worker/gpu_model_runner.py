@@ -253,6 +253,13 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def is_hybrid_replay_step(scheduler_output: "SchedulerOutput") -> bool:
+    """holes/M: true iff the step carries any hybrid replay step. Such a step
+    runs eager/piecewise only: no FULL CUDA graph and no microbatching
+    (num_computed_tokens_cpu holds the logical frontier during replay)."""
+    return bool(getattr(scheduler_output, "hybrid_replay_steps", None))
+
+
 def count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     """Per-row NaN counts, left on device."""
     return logits.isnan().sum(dim=-1, dtype=torch.int32)
@@ -4084,10 +4091,13 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=False,
-                disable_full_cudagraph=hole_segments is not None,
+                disable_full_cudagraph=(
+                    hole_segments is not None or is_hybrid_replay_step(scheduler_output)
+                ),
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 allow_microbatching=(
                     hole_segments is None
+                    and not is_hybrid_replay_step(scheduler_output)
                     and self._allow_microbatching(num_reqs, num_scheduled_tokens_np)
                 ),
             )

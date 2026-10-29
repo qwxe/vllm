@@ -190,6 +190,15 @@ class Request:
         # holes/L2: ranges a parked request waits for the connector to load
         # (WAITING_FOR_REMOTE_KVS); the blocks are cached only once loaded.
         self.pending_load_ranges: list[tuple[int, int]] = []
+        # holes/M: request-local hybrid replay plan (default absent). While it
+        # runs, num_computed_tokens stays the logical frontier C; the actual
+        # executed progress is hybrid_span_idx / hybrid_span_done. At most one
+        # replay step is outstanding (hybrid_step_pending).
+        self.hybrid_plan: Any = None
+        self.hybrid_plan_id: int = 0
+        self.hybrid_span_idx: int = 0
+        self.hybrid_span_done: int = 0
+        self.hybrid_step_pending: bool = False
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
