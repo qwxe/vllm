@@ -30,7 +30,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.eviction import session_id_of
-from vllm.v1.core.holes import get_hole_config, range_tokens, subtract_ranges
+from vllm.v1.core.holes import (
+    get_hole_config,
+    hybrid_completed_prefix,
+    range_tokens,
+    subtract_ranges,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
@@ -1744,6 +1749,14 @@ class OffloadingConnectorScheduler:
                 if isinstance(holes, list) and holes:
                     # holes: blocks of an uncomputed hole are never offered.
                     num_tokens_after_batch = min(num_tokens_after_batch, holes[0][0])
+                plan = getattr(req, "hybrid_plan", None)
+                if plan is not None:
+                    # holes/M (stage 4): only the contiguous completed replay
+                    # range of a hybrid plan is valid KV.
+                    num_tokens_after_batch = min(
+                        num_tokens_after_batch,
+                        hybrid_completed_prefix(plan, req.hybrid_completed),
+                    )
             elif req.is_finished():
                 # Clamp to the GPU prefix cache's commit point. The final sampled
                 # token's slot is never committed (under spec decode it holds a

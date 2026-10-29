@@ -290,6 +290,32 @@ class HybridLookup:
     load_ranges: dict[int, list[Range]] = field(default_factory=dict)
 
 
+def hybrid_completed_prefix(
+    plan: "HybridReplayPlan", completed: list[Range]
+) -> int:
+    """holes/M (stage 4, store cap): the end of the contiguous prefix of the
+    prompt whose KV is valid while a hybrid plan runs: everything below the
+    first span (retained), each span only as far as its completed replay
+    reaches, and the retained gap after a fully completed span."""
+    if not plan.spans:
+        return plan.frontier
+    cap = plan.spans[0][0]
+    for s, e in plan.spans:
+        cap = max(cap, s)  # the retained gap after a fully completed span
+        done = s
+        advanced = True
+        while advanced and done < e:
+            advanced = False
+            for cs, ce in completed:
+                if cs <= done < ce:
+                    done = ce
+                    advanced = True
+        cap = min(done, e)
+        if cap < e:
+            return cap
+    return plan.frontier
+
+
 def _close_spans(
     full_missing: list[Range], state_ok: Any, frontier: int
 ) -> list[Range]:

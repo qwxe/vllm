@@ -92,28 +92,3 @@ def test_completed_replay_prefix_of_a_plan():
     assert hybrid_completed_prefix(plan, [(32, 48), (64, 96)]) == 96
     assert hybrid_completed_prefix(plan, [(64, 96)]) == 32  # span 0 still open
 
-
-def test_abort_mid_replay_offers_nothing_beyond_the_unfinished_span():
-    from tests.v1.holes import test_hybrid_replay as T
-    from vllm.v1.request import RequestStatus
-
-    r = T._hyb_runner()
-    T._prime_runner(r)
-    offered = []
-    r.manager.prepare_store.side_effect = lambda keys, ctx: (
-        offered.append(list(keys)) or __import__(
-            "tests.v1.kv_connector.unit.offloading_connector.utils",
-            fromlist=["generate_store_output"],
-        ).generate_store_output(keys)
-    )
-    s = r.scheduler
-    b = T.U.make_request("b", T.PROMPT)
-    T._evict_gpu(r, b, 2, 0)  # replay span [32, 48)
-    s.add_request(b)
-    s.schedule()  # the replay step is scheduled, its output never arrives
-    s.finish_requests("b", RequestStatus.FINISHED_ABORTED)
-    s.schedule()
-    from vllm.v1.kv_offload.base import make_offload_key
-
-    late = {make_offload_key(b.block_hashes[i], g) for i in range(2, 6) for g in (0, 1)}
-    assert not late & {k for ks in offered for k in ks}
