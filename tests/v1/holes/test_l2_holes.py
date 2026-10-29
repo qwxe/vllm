@@ -396,3 +396,35 @@ def test_t15_abort_mid_hole_offers_nothing_past_the_first_pending_hole():
         for k in keys:
             idx = [i for i in range(len(b.block_hashes)) if _key(b, i) == k][0]
             assert (idx + 1) * BS <= first_pending
+
+
+# ------------------------------------------------------------------ L commit 5: the synthetic workload of the GPU driver (CPU part)
+
+
+def test_l2_e2e_synthetic_workload_plan():
+    """The seeded synthetic multi-turn generator of gpu_l2_e2e.py (labelled
+    synthetic: no claim about real traces)."""
+    from tests.v1.holes import gpu_l2_e2e as G
+
+    plan = G.plan_workload(seed=1234, n_sessions=24, concurrency=6, max_turns=8)
+    assert plan == G.plan_workload(seed=1234, n_sessions=24, concurrency=6, max_turns=8)
+    assert plan != G.plan_workload(seed=1235, n_sessions=24, concurrency=6, max_turns=8)
+    reqs = plan["requests"]
+    assert {r["session"] for r in reqs} == set(range(24))
+    for s in range(24):
+        turns = [r for r in reqs if r["session"] == s]
+        assert [r["turn"] for r in turns] == list(range(len(turns)))
+        assert 1 <= len(turns) <= 8
+        assert 256 <= turns[0]["new_tokens"] <= 1024
+        assert all(64 <= r["new_tokens"] <= 256 for r in turns[1:])
+    # at most 6 sessions are open at any point of the request order
+    open_s, peak = set(), 0
+    last = {s: max(i for i, r in enumerate(reqs) if r["session"] == s) for s in range(24)}
+    for i, r in enumerate(reqs):
+        open_s.add(r["session"])
+        peak = max(peak, len(open_s))
+        if last[r["session"]] == i:
+            open_s.discard(r["session"])
+    assert peak <= 6
+    assert len(plan["tool_gaps"]) == len(reqs) - 24 and all(g > 0 for g in plan["tool_gaps"])
+    assert plan["p_end"] == 1 / 8
