@@ -155,6 +155,33 @@ def test_t11_activation_table(connector, extra, allowed):
     assert (reason is None) == allowed
 
 
+def _hybrid_gate(connector, extra):
+    """Run Scheduler._hybrid_holes_effective on a stub scheduler (M 7, Q5 (a))."""
+    from types import SimpleNamespace as NS
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    stub = NS(
+        kv_cache_manager=NS(
+            hybrid_holes_enabled=True, coordinator=NS(hybrid_kinds=["full", "swa"])
+        ),
+        use_eagle=False,
+        use_v2_model_runner=False,
+        connector=connector,
+        hole_config=NS(test_hooks=False),
+    )
+    cfg = NS(kv_transfer_config=NS(kv_connector_extra_config=extra))
+    return Scheduler._hybrid_holes_effective(stub, cfg)
+
+
+def test_hybrid_gate_admits_only_the_offloading_connector_rate_path():
+    # a non-Offloading mask connector keeps hybrid holes off (M 7, Q5 (a))
+    assert _hybrid_gate(_MaskOnly(), None) is False
+    assert _hybrid_gate(_MaskOnly(), {"eviction_policy": "rate"}) is False
+    assert _hybrid_gate(_NoMask(), {"eviction_policy": "rate"}) is False
+    assert _hybrid_gate(_L2Fake(), {"eviction_policy": "lru"}) is False
+
+
 def test_t11_multiconnector_keeps_holes_off():
     from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
         MultiConnector,
