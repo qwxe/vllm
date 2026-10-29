@@ -1783,6 +1783,14 @@ class OffloadingConnectorScheduler:
                         num_tokens_after_batch,
                         remaining[0][0] if remaining else req.num_computed_tokens + n_tail,
                     )
+                plan = getattr(req, "hybrid_plan", None)
+                if isinstance(plan, HybridReplayPlan):
+                    # holes/M 6 (completed-only): a replay piece scheduled in
+                    # this step is not offered until its output completed.
+                    num_tokens_after_batch = min(
+                        num_tokens_after_batch,
+                        hybrid_completed_prefix(plan, req.hybrid_completed),
+                    )
 
             num_offloadable_tokens = self._calc_num_offloadable_tokens(
                 req_status, num_tokens_after_batch
